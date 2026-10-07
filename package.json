@@ -1,0 +1,33 @@
+{
+  "name": "pi-auto-handoff",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dpaluy/pi-auto-handoff.git"
+  },
+  "homepage": "https://github.com/dpaluy/pi-auto-handoff#readme",
+  "bugs": { "url": "https://github.com/dpaluy/pi-auto-handoff/issues" },
+  "description": "Automatic session checkpoints and explicit fresh-session continuation for Pi",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "files": ["src/", "README.md", "CHANGELOG.md", "LICENSE.txt", "handoff-preview.png"],
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "image": "https://raw.githubusercontent.com/dpaluy/pi-auto-handoff/master/handoff-preview.png"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": { "node": ">=22.19.0" }
+}
