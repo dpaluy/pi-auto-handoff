@@ -6,7 +6,7 @@ import { test, type TestContext } from "node:test";
 import { buildSessionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { loadExtensions } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
 import extension from "../src/index.ts";
-import { ENTRY_TYPE, latestHandoff, MAX_INPUT_CHARS, snapshot } from "../src/handoff.ts";
+import { ENTRY_TYPE, latestHandoff, MAX_INPUT_CHARS, REQUEST_TIMEOUT_MS, RETRY_DELAY_MS, snapshot } from "../src/handoff.ts";
 
 const flush = async () => { for (let i = 0; i < 5; i++) await new Promise<void>((done) => setImmediate(done)); };
 const usage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -25,7 +25,7 @@ async function fixture(t: TestContext, ephemeral = false) {
   const notices: string[] = [];
   const statuses: (string | undefined)[] = [];
   let idle = true, queued = false, percent: number | null = 20, replaced = false;
-  let provider: () => Promise<any> = async () => response();
+  let provider: (options: any) => Promise<any> = async () => response();
   let appendFails = false, switchCanceled = false, deliveryFails = false;
   let replacement: SessionManager | undefined;
   let sourceAccessAfterSwitch = 0;
@@ -47,7 +47,7 @@ async function fixture(t: TestContext, ephemeral = false) {
     waitForIdle: async () => { check(); },
     modelRegistry: { streamSimple: (selected: any, context: any, options: any) => {
       check(); calls.push({ model: selected, context, options });
-      return { result: provider };
+      return { result: () => provider(options) };
     } },
     newSession: async (options: any) => {
       check();
@@ -94,7 +94,7 @@ async function fixture(t: TestContext, ephemeral = false) {
     invoke: (args = "") => commands.get("handoff").handler(args, ctx),
     emit: (name: string) => handlers.get(name)?.({}, ctx),
     note: () => latestHandoff(manager.getBranch()),
-    setProvider: (value: () => Promise<any>) => { provider = value; },
+    setProvider: (value: (options: any) => Promise<any>) => { provider = value; },
     setIdle: (value: boolean) => { idle = value; }, setQueued: (value: boolean) => { queued = value; },
     setPercent: (value: number | null) => { percent = value; },
     failAppend: () => { appendFails = true; }, cancelSwitch: () => { switchCanceled = true; },
@@ -264,10 +264,159 @@ test("timeout returns control even when the provider never completes", async (t)
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
   const f = await fixture(t); f.setProvider(() => new Promise(() => {}));
   const command = f.invoke("continue"); await flush();
-  t.mock.timers.tick(40_000); await command;
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+  t.mock.timers.tick(RETRY_DELAY_MS); await command;
+  assert.equal(f.calls.length, 1);
+  await f.invoke();
+  assert.equal(f.calls.length, 1, "an ignored abort also blocks later commands");
   assert.equal(f.calls[0].options.signal.aborted, true);
   assert.equal(f.note(), undefined); assert.equal(f.replacement, undefined);
   assert.match(f.notices.join("\n"), /timed out/);
+});
+
+const abortableProvider = ({ signal }: { signal: AbortSignal }) => new Promise<any>((_, reject) => {
+  signal.addEventListener("abort", () => reject(new Error("provider aborted")), { once: true });
+});
+const checkpointCount = (manager: SessionManager) => manager.getBranch()
+  .filter((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE).length;
+
+test("requests can complete after the old deadline without retrying", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  let finish!: (value: any) => void;
+  f.setProvider(() => new Promise((resolve) => { finish = resolve; }));
+  const command = f.invoke(); await flush();
+  t.mock.timers.tick(40_000); await flush();
+  assert.equal(f.calls[0].options.signal.aborted, false);
+  finish(response()); await command;
+  assert.equal(f.calls.length, 1); assert.equal(checkpointCount(f.manager), 1);
+});
+
+test("timeout retries once after five seconds, saves once and continues once", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  f.setProvider((options) => f.calls.length === 1 ? abortableProvider(options) : Promise.resolve(response()));
+  const command = f.invoke("continue"); await flush();
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS - 1); await flush();
+  assert.equal(f.calls[0].options.signal.aborted, false);
+  t.mock.timers.tick(1); await flush();
+  assert.equal(f.calls[0].options.signal.aborted, true);
+  t.mock.timers.tick(RETRY_DELAY_MS - 1); await flush(); assert.equal(f.calls.length, 1);
+  t.mock.timers.tick(1); await command;
+  assert.equal(f.calls.length, 2); assert.equal(checkpointCount(f.manager), 1);
+  assert.ok(f.replacement); assert.equal(f.sourceAccessAfterSwitch, 0);
+  for (const call of f.calls) assert.equal(call.options.maxRetries, 0);
+  assert.equal(f.notices.filter((text) => text.includes("Handoff loaded")).length, 1);
+});
+
+test("two local timeouts exhaust recovery and do not rearm pressure attempts", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t); f.setProvider(abortableProvider);
+  f.setPercent(90); f.flags.set("handoff-idle-minutes", "0");
+  await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+  // A new settlement must not cancel or restart a checkpoint in backoff.
+  await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
+  t.mock.timers.tick(RETRY_DELAY_MS); await flush(); assert.equal(f.calls.length, 2);
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+  await f.emit("agent_settled"); t.mock.timers.tick(0);
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS + RETRY_DELAY_MS); await flush();
+  assert.equal(f.calls.length, 2); assert.equal(f.note(), undefined);
+  assert.match(f.notices.join("\n"), /timed out after 120 seconds/);
+});
+
+for (const event of ["input", "agent_start", "model_select", "session_tree", "session_start", "session_shutdown"]) {
+  test(`${event} cancels timeout backoff without retry or replacement`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const f = await fixture(t); f.setProvider(abortableProvider);
+    const command = f.invoke("continue"); await flush();
+    t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+    await f.emit(event); await command;
+    t.mock.timers.tick(RETRY_DELAY_MS + REQUEST_TIMEOUT_MS); await flush();
+    assert.equal(f.calls.length, 1); assert.equal(f.note(), undefined);
+    assert.equal(f.replacement, undefined);
+  });
+}
+
+for (const change of ["branch", "model", "active", "queued"]) {
+  test(`${change} change without hook prevents retry of stale evidence`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+    const f = await fixture(t); f.setProvider(abortableProvider);
+    const command = f.invoke("continue"); await flush();
+    t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+    if (change === "branch") f.manager.branch(f.firstUser);
+    if (change === "model") f.ctx.model = { ...f.ctx.model, id: "different" };
+    if (change === "active") f.setIdle(false);
+    if (change === "queued") f.setQueued(true);
+    t.mock.timers.tick(RETRY_DELAY_MS); await command;
+    assert.equal(f.calls.length, 1); assert.equal(f.note(), undefined);
+    assert.equal(f.replacement, undefined);
+  });
+}
+
+test("a provider stopping during backoff allows retry but its late output is discarded", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  let finish!: (value: any) => void;
+  f.setProvider(() => f.calls.length === 1 ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve(response("Retry result")));
+  const command = f.invoke(); await flush();
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+  t.mock.timers.tick(2_000); finish(response("Late result")); await flush();
+  t.mock.timers.tick(RETRY_DELAY_MS - 2_000); await command;
+  assert.equal(f.calls.length, 2); assert.equal(f.note()?.text, "Retry result");
+  assert.equal(checkpointCount(f.manager), 1);
+});
+
+test("cancellation during retry discards late output without duplicate checkpoints", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  let finish!: (value: any) => void;
+  f.setProvider((options) => f.calls.length === 1 ? abortableProvider(options) : new Promise((resolve) => { finish = resolve; }));
+  const command = f.invoke("continue"); await flush();
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+  t.mock.timers.tick(RETRY_DELAY_MS); await flush();
+  assert.equal(f.calls.length, 2);
+  await f.emit("session_start"); await command;
+  finish(response()); await flush();
+  assert.equal(f.calls[1].options.signal.aborted, true);
+  assert.equal(checkpointCount(f.manager), 0); assert.equal(f.replacement, undefined);
+});
+
+test("an ignored abort blocks requests until settlement but never saves late output", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  let finish!: (value: any) => void;
+  f.setProvider(() => new Promise((resolve) => { finish = resolve; }));
+  const command = f.invoke(); await flush();
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+  t.mock.timers.tick(RETRY_DELAY_MS); await command;
+  await f.invoke(); assert.equal(f.calls.length, 1);
+  finish(response("Late output")); await flush();
+  assert.equal(checkpointCount(f.manager), 0);
+  f.setProvider(async () => response("New output")); await f.invoke();
+  assert.equal(f.calls.length, 2); assert.equal(f.note()?.text, "New output");
+  assert.equal(checkpointCount(f.manager), 1);
+});
+
+test("branch changes during retry discard its result without saving or switching", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  let finish!: (value: any) => void;
+  f.setProvider((options) => f.calls.length === 1 ? abortableProvider(options) : new Promise((resolve) => { finish = resolve; }));
+  const command = f.invoke("continue"); await flush();
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS); await flush();
+  t.mock.timers.tick(RETRY_DELAY_MS); await flush();
+  f.manager.branch(f.firstUser); finish(response()); await command;
+  assert.equal(f.calls.length, 2); assert.equal(checkpointCount(f.manager), 0);
+  assert.equal(f.replacement, undefined);
+});
+
+test("provider errors that resemble timeouts are not retried", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  f.setProvider(async () => { throw new Error("Handoff timed out after 120 seconds. Retry with /handoff."); });
+  await f.invoke(); t.mock.timers.tick(REQUEST_TIMEOUT_MS + RETRY_DELAY_MS); await flush();
+  assert.equal(f.calls.length, 1); assert.equal(f.note(), undefined);
 });
 
 test("save failure does not switch or hide the previous checkpoint", async (t) => {

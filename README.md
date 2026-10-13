@@ -1,6 +1,6 @@
 # pi-auto-handoff
 
-Version **0.1.0**. [Changelog](CHANGELOG.md).
+Version **0.1.1**. [Changelog](CHANGELOG.md).
 
 Save work checkpoints after inactivity or high context use. Continue in a linked fresh Pi session when ready.
 
@@ -43,6 +43,8 @@ pi --handoff-idle-minutes 30 --handoff-context-percent 80
 ```
 
 Set either value to `0` to disable that trigger.
+
+Each checkpoint request has a **120-second timeout**. On timeout, the extension aborts the request and retries **once after 5 seconds**, only if the first request has stopped and the session is still idle and unchanged. New input or session/model changes cancel recovery. If the provider does not stop during backoff, recovery fails without starting another request; later attempts stay blocked until it stops. Other failures are not retried.
 
 ## Privacy
 

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ENTRY_TYPE, generateHandoff, latestHandoff, REQUEST_TIMEOUT_MS, snapshot, sourceEntryId, type Handoff, type Trigger } from "./handoff.ts";
+import { ENTRY_TYPE, generateHandoff, latestHandoff, REQUEST_TIMEOUT_MS, RETRY_DELAY_MS, snapshot, sourceEntryId, type Handoff, type Trigger } from "./handoff.ts";
 
 const STATUS_KEY = "auto-handoff";
 
@@ -9,6 +9,7 @@ export default function autoHandoff(pi: ExtensionAPI) {
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let request: AbortController | undefined;
+  let pendingGeneration: Promise<Handoff> | undefined;
   let epoch = 0;
   let pressureAttempted = false;
   let idleAttempted = false;
@@ -42,6 +43,7 @@ export default function autoHandoff(pi: ExtensionAPI) {
 
   async function prepare(ctx: ExtensionContext, trigger: Trigger): Promise<Handoff | undefined> {
     if (!eligible(ctx)) throw new Error("Handoff requires an idle, saved session with no queued input.");
+    if (pendingGeneration) throw new Error("Handoff request is still stopping. Retry after it finishes.");
     const existing = saved(ctx);
     if (existing && current(ctx, existing)) return existing;
     const captured = snapshot(ctx);
@@ -51,22 +53,66 @@ export default function autoHandoff(pi: ExtensionAPI) {
     const controller = new AbortController();
     request = controller;
     status(ctx, "preparing");
-    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const model = ctx.model;
+    const unchanged = () => lifetime === epoch && eligible(ctx) && ctx.model === model
+      && ctx.sessionManager.getSessionId() === captured.sessionId
+      && ctx.sessionManager.getLeafId() === captured.leafId;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let abort!: () => void;
     const stopped = new Promise<never>((_, reject) => {
       abort = () => reject(new Error("Handoff canceled because the session changed."));
       controller.signal.addEventListener("abort", abort, { once: true });
-      timeout = setTimeout(() => {
-        reject(new Error("Handoff timed out after 40 seconds. Retry with /handoff."));
-        controller.abort();
-      }, REQUEST_TIMEOUT_MS);
-      timeout.unref();
     });
     let note: Handoff | undefined;
     try {
-      note = await Promise.race([generateHandoff(ctx, captured, trigger, controller.signal, existing), stopped]);
-      if (lifetime !== epoch || !eligible(ctx) || ctx.sessionManager.getSessionId() !== captured.sessionId
-        || ctx.sessionManager.getLeafId() !== captured.leafId) return;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (!unchanged()) return;
+        const attemptController = new AbortController();
+        const cancelAttempt = () => attemptController.abort();
+        controller.signal.addEventListener("abort", cancelAttempt, { once: true });
+        let timedOut = false;
+        let settled = false;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const timeoutError = new Error("Handoff timed out after 120 seconds. Retry with /handoff.");
+        const generation = generateHandoff(ctx, captured, trigger, attemptController.signal, existing);
+        pendingGeneration = generation;
+        // Observe both outcomes: an ignored abort must not allow an overlapping request,
+        // even after this operation returns control to Pi.
+        const finished = () => {
+          settled = true;
+          if (pendingGeneration === generation) pendingGeneration = undefined;
+        };
+        void generation.then(finished, finished);
+        const deadline = new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            timedOut = true;
+            reject(timeoutError);
+            attemptController.abort();
+          }, REQUEST_TIMEOUT_MS);
+          timeout.unref();
+        });
+        try {
+          note = await Promise.race([generation, deadline, stopped]);
+          break;
+        } catch (error) {
+          if (!timedOut || attempt === 1 || !unchanged()) throw error;
+          status(ctx, "timed out; retrying in 5 seconds");
+          // This also bounds cancellation acknowledgement. If the provider still
+          // hasn't stopped after backoff, fail rather than overlap requests.
+          await Promise.race([new Promise<void>((resolve) => {
+            retryTimer = setTimeout(resolve, RETRY_DELAY_MS);
+            retryTimer.unref();
+          }), stopped]);
+          if (!unchanged()) return;
+          if (!settled) throw timeoutError;
+          status(ctx, "preparing (retry)");
+        } finally {
+          clearTimeout(timeout);
+          controller.signal.removeEventListener("abort", cancelAttempt);
+          attemptController.abort();
+        }
+      }
+      if (!note || !unchanged()) return;
       try { pi.appendEntry(ENTRY_TYPE, note); }
       catch (error) { failedNotes.add(note.id); throw error; }
       report(ctx, "Saved; /handoff continue");
@@ -76,7 +122,7 @@ export default function autoHandoff(pi: ExtensionAPI) {
       if (note) throw new Error("Handoff could not be saved. The source session was not replaced.");
       throw error;
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(retryTimer);
       controller.signal.removeEventListener("abort", abort);
       controller.abort();
       if (request === controller) request = undefined;
@@ -86,11 +132,11 @@ export default function autoHandoff(pi: ExtensionAPI) {
   // A timer runs after the notification-only settlement handler has returned.
   const schedule = (ctx: ExtensionContext) => {
     clearTimeout(timer);
-    if ((ctx.mode !== "tui" && ctx.mode !== "rpc") || !eligible(ctx) || commandBusy) return;
+    if ((ctx.mode !== "tui" && ctx.mode !== "rpc") || !eligible(ctx) || commandBusy || request) return;
     const lifetime = epoch;
     timer = setTimeout(() => {
       timer = undefined;
-      if (lifetime !== epoch || !eligible(ctx) || commandBusy) return;
+      if (lifetime !== epoch || !eligible(ctx) || commandBusy || request) return;
       try {
         const threshold = numberFlag("handoff-context-percent", 100);
         const minutes = numberFlag("handoff-idle-minutes", 1_440);
@@ -115,7 +161,7 @@ export default function autoHandoff(pi: ExtensionAPI) {
           const due = Date.now() + wait;
           timer = setTimeout(() => {
             timer = undefined;
-            if (lifetime !== epoch || !eligible(ctx) || commandBusy) return;
+            if (lifetime !== epoch || !eligible(ctx) || commandBusy || request) return;
             idleAttempted = true;
             if (Date.now() > due + wait * 0.1) { status(ctx, "idle checkpoint skipped after late wake"); return; }
             automatic("idle");

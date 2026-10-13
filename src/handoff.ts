@@ -5,7 +5,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 export const ENTRY_TYPE = "pi-auto-handoff";
 export const MAX_INPUT_CHARS = 48_000;
 export const MAX_OUTPUT_TOKENS = 2_048;
-export const REQUEST_TIMEOUT_MS = 40_000;
+export const REQUEST_TIMEOUT_MS = 120_000;
+export const RETRY_DELAY_MS = 5_000;
 export type Trigger = "idle" | "pressure" | "manual";
 export interface Handoff {
   version: 1;
