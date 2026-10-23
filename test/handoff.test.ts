@@ -550,6 +550,11 @@ test("file records survive successive explicit continuations", async (t) => {
   second.manager.appendMessage({ ...response(), content: [{ type: "toolCall", id: "record-read", name: "read", arguments: { path: "second.ts" } }], api: "openai-completions", provider: "fixture", model: "chat", timestamp: Date.now() } as any);
   await second.invoke("continue");
   assert.deepEqual(second.note()?.files, { read: ["second.ts"], modified: ["original.ts"], truncated: false });
+  // The inherited handoff is the previous handoff; neither it nor our continuation prompt is clipped evidence.
+  const request = JSON.parse(second.calls[0].context.messages[0].content);
+  assert.equal(request.previousHandoff, first.note()!.text);
+  assert.doesNotMatch(request.evidence, /Continue from the saved handoff above|pi-auto-handoff-context/);
+  assert.match(request.evidence.split("\n")[0], /user message/);
   const captured = snapshot({ ...second.ctx, sessionManager: second.replacement } as any);
   assert.deepEqual(captured.files, { read: ["second.ts"], modified: ["original.ts"], truncated: false });
   assert.equal(first.sourceAccessAfterSwitch, 0);

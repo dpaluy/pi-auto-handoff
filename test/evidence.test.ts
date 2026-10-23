@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { evidence, excerpt, formatRecordedFiles, MAX_FILE_CHARS, MAX_FILE_COUNT, recordedFiles, validRecordedFiles } from "../src/evidence.ts";
+import { CONTINUATION_PROMPT, evidence, excerpt, formatRecordedFiles, MAX_FILE_CHARS, MAX_FILE_COUNT, recordedFiles, validRecordedFiles } from "../src/evidence.ts";
 import { ENTRY_TYPE, generateHandoff, latestHandoff, snapshot } from "../src/handoff.ts";
 
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -187,7 +187,9 @@ test("linked transfer metadata requires effective unedited transfer and valid bo
       const user = manager.appendMessage({ role: "user", content: "Work", timestamp: 1 });
       manager.appendContextEdit(user, { content: "Revised work" });
     }
-    assert.deepEqual(snapshot(ctx).files?.read, edit === "none" ? ["inherited.ts"] : []);
+    // Edits to later entries cannot change what the parent recorded.
+    assert.deepEqual(snapshot(ctx).files?.read, edit === "none" || edit === "unrelated" ? ["inherited.ts"] : []);
+    assert.equal(snapshot(ctx).inheritedHandoff, edit === "none" || edit === "unrelated" ? "Prior checkpoint" : undefined);
     if (edit === "replace") assert.match(snapshot(ctx).evidence, /Revised checkpoint/);
     if (edit === "omit" || edit === "replace") assert.doesNotMatch(snapshot(ctx).evidence, /Prior checkpoint/);
   }
@@ -216,6 +218,66 @@ test("compacted transfers retain bounds, linkage, branch and context-edit guards
       manager.appendContextEdit(user, { content: "Revised work" });
     }
     assert.deepEqual(snapshot({ sessionManager: manager } as unknown as ExtensionContext).files?.read,
-      change === "none" ? ["inherited.ts"] : [], change);
+      change === "none" || change === "unrelated" ? ["inherited.ts"] : [], change);
   }
+});
+
+test("continued sessions send the inherited handoff in full as the previous handoff, not as clipped coordination", async () => {
+  const manager = SessionManager.inMemory("/tmp", { parentSession: "/tmp/source.jsonl" });
+  const inherited = "## Goal\nShip X\n## User constraints\nNever deploy on Fridays\n## Decisions and reasons\n" + "d".repeat(6_000) + "\n## Next action\nRun the integration tests";
+  manager.appendCustomMessageEntry("pi-auto-handoff-context", inherited, true, { sourceSession: "source", sourceEntryId: "source-entry", handoffId: "checkpoint" });
+  manager.appendMessage({ role: "user", content: CONTINUATION_PROMPT, timestamp: 1 });
+  manager.appendMessage({ role: "user", content: "Also update the changelog.", timestamp: 1 });
+  manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Integration tests pass." }], timestamp: 1, api: "openai-completions", provider: "fixture", model: "chat", stopReason: "stop", usage });
+  const ctx = { sessionManager: manager, model: { provider: "fixture", id: "chat", contextWindow: 100_000, maxTokens: 4_096 } } as unknown as ExtensionContext;
+  const captured = snapshot(ctx);
+  assert.equal(captured.inheritedHandoff, inherited);
+  assert.doesNotMatch(captured.evidence, /Never deploy on Fridays|not direct user intent/);
+  assert.doesNotMatch(captured.evidence, /Continue from the saved handoff above/);
+  assert.match(captured.evidence.split("\n")[0], /user message/);
+  assert.match(captured.evidence, /Also update the changelog/);
+  let request: any, prompt = "";
+  (ctx as any).modelRegistry = { streamSimple: (_model: unknown, context: any) => {
+    request = JSON.parse(context.messages[0].content); prompt = context.systemPrompt;
+    return { result: async () => ({ content: [{ type: "text", text: "Next checkpoint" }], stopReason: "stop", usage }) };
+  } };
+  await generateHandoff(ctx, captured, "manual", new AbortController().signal);
+  assert.equal(request.previousHandoff, inherited);
+  assert.match(prompt, /linked parent session; carry forward its goal, user constraints/);
+});
+
+test("after a local checkpoint, the inherited handoff stays labelled as a handoff in evidence", () => {
+  const manager = SessionManager.inMemory("/tmp", { parentSession: "/tmp/source.jsonl" });
+  manager.appendCustomMessageEntry("pi-auto-handoff-context", "Inherited constraint: keep the public API.", true, { sourceSession: "source", sourceEntryId: "source-entry", handoffId: "checkpoint" });
+  const work = manager.appendMessage({ role: "user", content: "Work", timestamp: 1 });
+  manager.appendCustomEntry(ENTRY_TYPE, { version: 1, id: "local", sessionId: manager.getSessionId(), sourceEntryId: work, createdAt: "now", trigger: "manual", model: "fixture/chat", text: "Local checkpoint", truncated: false });
+  manager.appendMessage({ role: "user", content: "More work", timestamp: 1 });
+  const captured = snapshot({ sessionManager: manager } as unknown as ExtensionContext);
+  assert.equal(captured.previousHandoffId, "local");
+  assert.equal(captured.inheritedHandoff, undefined);
+  assert.match(captured.evidence, /inherited handoff from linked parent session[^\n]*\]\nInherited constraint: keep the public API\./);
+});
+
+test("unlinked transfers and other continuation-like text keep normal provenance", () => {
+  const f = fixture();
+  f.manager.appendCustomMessageEntry("pi-auto-handoff-context", "Unlinked checkpoint", true, { sourceSession: "source", sourceEntryId: "source-entry", handoffId: "checkpoint" });
+  f.user(`${CONTINUATION_PROMPT} Plus a real request.`);
+  const captured = snapshot(f.ctx);
+  assert.equal(captured.inheritedHandoff, undefined);
+  assert.match(captured.evidence, /extension\/coordination pi-auto-handoff-context \(not direct user intent\)[^\n]*\]\nUnlinked checkpoint/);
+  assert.match(captured.evidence, /Plus a real request/);
+});
+
+test("edits to entries after a checkpoint keep its summary and file records reusable", () => {
+  const f = fixture(); const root = f.user("Task");
+  f.assistant([{ type: "toolCall", id: "call", name: "write", arguments: { path: "kept.ts" } }]);
+  const note = { version: 1, id: "old", sessionId: f.manager.getSessionId(), sourceEntryId: root, createdAt: "now", trigger: "manual", model: "fixture/chat", text: "Checkpoint", truncated: false, files: { read: [], modified: ["kept.ts"], truncated: false } };
+  f.manager.appendCustomEntry(ENTRY_TYPE, note);
+  const later = f.user("Paste of a large log");
+  f.manager.appendContextEdit(later, null);
+  const captured = snapshot(f.ctx);
+  assert.equal(captured.previousHandoffId, "old");
+  assert.deepEqual(captured.files?.modified, ["kept.ts"]);
+  f.manager.appendContextEdit(root, { content: "Revised task" });
+  assert.equal(snapshot(f.ctx).previousHandoffId, undefined);
 });

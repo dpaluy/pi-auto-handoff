@@ -3,6 +3,7 @@
 ## 0.2.0 - 2026-10-24
 
 - Preserve head and tail evidence with provenance labels, consistent handoff section instructions, and bounded recorded file-operation lists.
+- Carry each continued session's inherited handoff into its next checkpoint as the previous handoff, so goals and user constraints survive successive continuations.
 - Add read-only, paginated `handoff_history` recovery restricted to the linked parent's saved source branch.
 - Add opt-in `--handoff-context-basis compaction` using file-backed settings; preserve existing window-percent defaults.
 - Render saved checkpoint cards and enrich `/handoff status` with usage, pressure policy, and diagnostics.
