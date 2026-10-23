@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -15,6 +15,10 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
   const dir = await mkdtemp(join(tmpdir(), "handoff-runtime-"));
   const errors: string[] = [];
   const requests: string[] = [];
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  let sourceEntryId = "";
+  let recoveredHistory = false;
   const provider = (pi: ExtensionAPI) => pi.registerProvider("handoff-fixture", {
     baseUrl: "http://fixture.invalid", apiKey: "local-fixture", api: "openai-completions",
     models: [{ id: "chat", name: "Local fixture", reasoning: false, input: ["text"],
@@ -23,17 +27,24 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
       const prompt = getCurrentSystemPrompt(context.messages);
       requests.push(prompt);
       const isSummary = prompt.includes("Write a work handoff");
+      const history = context.messages.findLast((message) => message.role === "toolResult" && message.toolName === "handoff_history");
+      if (history) {
+        assert.match(JSON.stringify(history), /Do not deploy/);
+        recoveredHistory = true;
+      }
+      const recover = !isSummary && requests.length === 3;
       const message: AssistantMessage = {
         role: "assistant", api: model.api, provider: model.provider, model: model.id,
-        timestamp: Date.now(), stopReason: "stop",
-        content: [{ type: "text", text: isSummary ? "## Goal\nFix the feature.\n\n## Next action\nRead current source before editing." : "Task response from local fixture." }],
+        timestamp: Date.now(), stopReason: recover ? "toolUse" : "stop",
+        content: recover ? [{ type: "toolCall", id: "recover-parent", name: "handoff_history", arguments: { op: "read", entryId: sourceEntryId } }]
+          : [{ type: "text", text: isSummary ? "## Goal\nFix the feature.\n\n## Next action\nRead current source before editing." : "Task response from local fixture." }],
         usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 120,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       };
       const stream = createAssistantMessageEventStream();
       queueMicrotask(() => {
         stream.push({ type: "start", partial: message });
-        stream.push({ type: "done", reason: "stop", message });
+        stream.push({ type: "done", reason: recover ? "toolUse" : "stop", message });
         stream.end();
       });
       return stream;
@@ -51,7 +62,7 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
     const model = modelRuntime.getModel("handoff-fixture", "chat");
     assert.ok(model);
     const result = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model,
-      thinkingLevel: "off", tools: [] });
+      thinkingLevel: "off", tools: ["handoff_history"] });
     return { ...result, services, diagnostics: services.diagnostics };
   };
   const runtime = await createAgentSessionRuntime(create, { cwd: dir, agentDir: dir, sessionManager: SessionManager.create(dir, dir) });
@@ -66,6 +77,7 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
   try {
     await bind(runtime.session);
     await runtime.session.prompt("Fix the feature. Do not deploy.");
+    sourceEntryId = runtime.session.sessionManager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")!.id;
     const sourceFile = runtime.session.sessionFile!;
     const sourceId = runtime.session.sessionId;
     await runtime.session.prompt("/handoff");
@@ -78,11 +90,18 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
     assert.equal(runtime.session.sessionManager.getHeader()?.parentSession, sourceFile);
     assert.match(JSON.stringify(runtime.session.messages), /Read current source before editing/);
     assert.equal(runtime.session.getLastAssistantText(), "Task response from local fixture.");
-    assert.equal(requests.length, 3, "source turn, summarization, and continuation only");
+    assert.equal(requests.length, 4, "source turn, one summarization, continuation tool call and tool follow-up only");
+    assert.equal(requests.filter((prompt) => prompt.includes("Write a work handoff")).length, 1);
+    assert.equal(recoveredHistory, true, "fresh continuation recovered source evidence with a real tool call");
     assert.equal(latestHandoff(SessionManager.open(sourceFile).getBranch())?.id, note.id);
     assert.deepEqual(errors, []);
+    const log = await readFile(join(dir, "auto-handoff.jsonl"), "utf8");
+    assert.deepEqual(log.trim().split("\n").map((line) => JSON.parse(line).event), ["start", "saved"]);
+    assert.doesNotMatch(log, /Do not deploy|Fix the feature|Read current source|evidence"|text"/);
   } finally {
     await runtime.dispose();
     await rm(dir, { recursive: true, force: true });
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
 });

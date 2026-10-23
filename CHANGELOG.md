@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Preserve head and tail evidence with provenance labels, consistent handoff section instructions, and bounded recorded file-operation lists.
+- Add read-only, paginated `handoff_history` recovery restricted to the linked parent's saved source branch.
+- Add opt-in `--handoff-context-basis compaction` using file-backed settings; preserve existing window-percent defaults.
+- Render saved checkpoint cards and enrich `/handoff status` with usage, pressure policy, and diagnostics.
+- Record bounded, metadata-only lifecycle diagnostics without blocking checkpoint operations.
+
 ## 0.1.1 - 2026-10-13
 
 - Increase the checkpoint generation timeout from 40 to 120 seconds.

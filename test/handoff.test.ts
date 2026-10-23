@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -13,13 +13,25 @@ const usage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens
 const response = (text = "## Goal\nFinish the task.\n\n## Next action\nRead the current tests before editing.") => ({
   role: "assistant", content: [{ type: "text", text }], stopReason: "stop", usage,
 });
+const isolatedTests = new WeakSet<TestContext>();
 const forbidden = () => { throw new Error("Unrelated Pi control was called"); };
 
-async function fixture(t: TestContext, ephemeral = false) {
+async function fixture(t: TestContext, ephemeral = false, initial?: SessionManager) {
   const dir = await mkdtemp(join(tmpdir(), "auto-handoff-"));
-  const manager = ephemeral ? SessionManager.inMemory(dir) : SessionManager.create(dir, dir);
+  if (!isolatedTests.has(t)) {
+    isolatedTests.add(t);
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    t.after(() => {
+      if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    });
+  }
+  process.env.PI_CODING_AGENT_DIR = dir;
+  const manager = initial ?? (ephemeral ? SessionManager.inMemory(dir) : SessionManager.create(dir, dir));
   const handlers = new Map<string, Function>();
   const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const renderers = new Map<string, any>();
   const flags = new Map<string, string>();
   const calls: any[] = [];
   const notices: string[] = [];
@@ -43,6 +55,7 @@ async function fixture(t: TestContext, ephemeral = false) {
     },
     isIdle: () => { check(); return idle; }, hasPendingMessages: () => { check(); return queued; },
     getContextUsage: () => { check(); return { tokens: percent === null ? null : percent * 1000, contextWindow: 100_000, percent }; },
+    isProjectTrusted: () => { check(); return true; },
     compact: forbidden, abort: forbidden,
     waitForIdle: async () => { check(); },
     modelRegistry: { streamSimple: (selected: any, context: any, options: any) => {
@@ -73,6 +86,8 @@ async function fixture(t: TestContext, ephemeral = false) {
     getFlag: (name: string) => { check(); return flags.get(name); },
     on: (name: string, fn: Function) => handlers.set(name, fn),
     registerCommand: (name: string, options: any) => commands.set(name, options),
+    registerTool: (options: any) => tools.set(options.name, options),
+    registerEntryRenderer: (name: string, renderer: any) => renderers.set(name, renderer),
     appendEntry: (type: string, data: any) => {
       check(); manager.appendCustomEntry(type, data);
       if (appendFails) throw new Error("disk full");
@@ -90,7 +105,11 @@ async function fixture(t: TestContext, ephemeral = false) {
     await rm(dir, { recursive: true, force: true });
   });
   return {
-    dir, manager, ctx, calls, notices, statuses, flags, handlers, firstUser, addUser,
+    dir, manager, ctx, calls, notices, statuses, flags, handlers, firstUser, addUser, tools, renderers,
+    diagnostics: async () => {
+      try { return (await readFile(join(dir, "auto-handoff.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+    },
     invoke: (args = "") => commands.get("handoff").handler(args, ctx),
     emit: (name: string) => handlers.get(name)?.({}, ctx),
     note: () => latestHandoff(manager.getBranch()),
@@ -108,6 +127,8 @@ test("native Pi loader loads the package entry", async () => {
   assert.deepEqual(loaded.errors, []);
   assert.equal(loaded.extensions.length, 1);
   assert.ok(loaded.extensions[0].commands.has("handoff"));
+  assert.ok(loaded.extensions[0].tools.has("handoff_history"));
+  assert.ok(loaded.extensions[0].entryRenderers?.has(ENTRY_TYPE));
 });
 
 test("manual checkpoint persists outside source context; reload and repeat reuse it", async (t) => {
@@ -127,6 +148,12 @@ test("manual checkpoint persists outside source context; reload and repeat reuse
   assert.match(await readFile(f.manager.getSessionFile()!, "utf8"), new RegExp(note.id));
   await f.emit("session_start"); await f.invoke();
   assert.equal(f.calls.length, 1);
+  assert.deepEqual((await f.diagnostics()).map((record) => record.event), ["start", "saved"], "reusing checkpoints does not log duplicate saves");
+  const saved = (await f.diagnostics()).at(-1)!;
+  assert.equal(saved.trigger, "manual");
+  assert.equal(saved.sessionId, f.manager.getSessionId());
+  assert.equal(saved.inputTokens, usage.input);
+  assert.equal(saved.outputTokens, usage.output);
 });
 
 test("continuation refreshes a stale note, preserves source, and only uses fresh context", async (t) => {
@@ -182,6 +209,7 @@ test("input aborts generation even when the provider ignores its signal", async 
   finish(response()); await flush();
   assert.equal(f.note(), undefined);
   assert.equal(f.replacement, undefined);
+  assert.deepEqual((await f.diagnostics()).map((record) => [record.event, record.reason]), [["start", undefined], ["cancelled", "session_changed"]]);
 });
 
 test("branch movement without a hook discards a stale async result", async (t) => {
@@ -215,6 +243,25 @@ test("pressure generates after settlement only, once per high-pressure episode",
   await f.emit("input"); f.addUser("Context grew again."); f.setPercent(80);
   await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
   assert.equal(f.calls.length, 2);
+});
+
+test("opt-in compaction pressure uses its configured budget and preserves episode suppression", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t); f.setPercent(65); f.flags.set("handoff-idle-minutes", "0");
+  await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
+  assert.equal(f.calls.length, 0, "default still uses 70% of the entire window");
+  f.flags.set("handoff-context-basis", "compaction");
+  await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
+  assert.equal(f.calls.length, 1, "65k exceeds 70% of the default file-backed compaction budget");
+  assert.equal(f.note()?.trigger, "pressure");
+  f.addUser("More work in the same pressure episode.");
+  await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
+  assert.equal(f.calls.length, 1);
+  f.setPercent(20); await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
+  f.setPercent(65); await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
+  assert.equal(f.calls.length, 2, "lower pressure rearms the next episode");
+  await f.invoke("status");
+  assert.match(f.notices.at(-1)!, /configured file-backed compaction budget/);
 });
 
 test("idle fires once, cancels on input, and rearms after returned work", async (t) => {
@@ -307,6 +354,11 @@ test("timeout retries once after five seconds, saves once and continues once", a
   assert.ok(f.replacement); assert.equal(f.sourceAccessAfterSwitch, 0);
   for (const call of f.calls) assert.equal(call.options.maxRetries, 0);
   assert.equal(f.notices.filter((text) => text.includes("Handoff loaded")).length, 1);
+  const records = await f.diagnostics();
+  assert.deepEqual(records.map((record) => record.event), ["start", "retry", "saved"]);
+  assert.equal(records[1].reason, "timeout");
+  assert.equal(records[1].attempt, 2);
+  assert.equal(records[2].durationMs, REQUEST_TIMEOUT_MS + RETRY_DELAY_MS);
 });
 
 test("two local timeouts exhaust recovery and do not rearm pressure attempts", async (t) => {
@@ -335,6 +387,9 @@ for (const event of ["input", "agent_start", "model_select", "session_tree", "se
     t.mock.timers.tick(RETRY_DELAY_MS + REQUEST_TIMEOUT_MS); await flush();
     assert.equal(f.calls.length, 1); assert.equal(f.note(), undefined);
     assert.equal(f.replacement, undefined);
+    const records = await f.diagnostics();
+    assert.deepEqual(records.map((record) => record.event), ["start", "retry", "cancelled"]);
+    assert.equal(records.at(-1)?.reason, "session_changed");
   });
 }
 
@@ -380,6 +435,7 @@ test("cancellation during retry discards late output without duplicate checkpoin
   finish(response()); await flush();
   assert.equal(f.calls[1].options.signal.aborted, true);
   assert.equal(checkpointCount(f.manager), 0); assert.equal(f.replacement, undefined);
+  assert.deepEqual((await f.diagnostics()).map((record) => record.event), ["start", "retry", "cancelled"], "late output never logs saved");
 });
 
 test("an ignored abort blocks requests until settlement but never saves late output", async (t) => {
@@ -428,6 +484,17 @@ test("save failure does not switch or hide the previous checkpoint", async (t) =
   assert.match(f.notices.at(-1)!, new RegExp(old.createdAt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
+test("diagnostic contention cannot prevent checkpoint persistence", async (t) => {
+  const f = await fixture(t);
+  await writeFile(join(f.dir, "auto-handoff.jsonl.lock"), "another writer");
+  await f.invoke();
+  assert.ok(f.note());
+  assert.equal(checkpointCount(f.manager), 1);
+  assert.deepEqual(await f.diagnostics(), []);
+  await f.invoke("status");
+  assert.match(f.notices.at(-1)!, /unavailable or busy/);
+});
+
 test("empty, incomplete, and tool-call responses never become checkpoints", async (t) => {
   const f = await fixture(t);
   for (const value of [response(""), { ...response(), stopReason: "length" }, { ...response(), content: [{ type: "toolCall", name: "write", arguments: {} }] }]) {
@@ -469,4 +536,36 @@ test("invalid trigger flags fail safely before automatic calls", async (t) => {
   const f = await fixture(t); f.flags.set("handoff-context-percent", "NaN");
   await f.emit("agent_settled"); t.mock.timers.tick(0); await flush();
   assert.equal(f.calls.length, 0); assert.match(f.notices.join("\n"), /must be a number/);
+});
+
+test("file records survive successive explicit continuations", async (t) => {
+  const first = await fixture(t);
+  first.manager.appendMessage({ ...response(), content: [{ type: "toolCall", id: "record-write", name: "write", arguments: { path: "original.ts" } }], api: "openai-completions", provider: "fixture", model: "chat", timestamp: Date.now() } as any);
+  await first.invoke("continue");
+  assert.deepEqual(first.note()?.files?.modified, ["original.ts"]);
+  const firstTransfer = first.replacement!.getBranch().find((entry) => entry.type === "custom_message" && entry.customType === "pi-auto-handoff-context");
+  assert.equal(firstTransfer?.type, "custom_message");
+  assert.deepEqual((firstTransfer as any).details.files.modified, ["original.ts"]);
+  const second = await fixture(t, false, first.replacement);
+  second.manager.appendMessage({ ...response(), content: [{ type: "toolCall", id: "record-read", name: "read", arguments: { path: "second.ts" } }], api: "openai-completions", provider: "fixture", model: "chat", timestamp: Date.now() } as any);
+  await second.invoke("continue");
+  assert.deepEqual(second.note()?.files, { read: ["second.ts"], modified: ["original.ts"], truncated: false });
+  const captured = snapshot({ ...second.ctx, sessionManager: second.replacement } as any);
+  assert.deepEqual(captured.files, { read: ["second.ts"], modified: ["original.ts"], truncated: false });
+  assert.equal(first.sourceAccessAfterSwitch, 0);
+  assert.equal(second.sourceAccessAfterSwitch, 0);
+});
+
+test("first checkpoint after continuation and native compaction retains inherited file records", async (t) => {
+  const source = await fixture(t);
+  source.manager.appendMessage({ ...response(), content: [{ type: "toolCall", id: "inherited-write", name: "write", arguments: { path: "inherited.ts" } }], api: "openai-completions", provider: "fixture", model: "chat", timestamp: Date.now() } as any);
+  await source.invoke("continue");
+  const continued = await fixture(t, false, source.replacement);
+  continued.manager.appendCompaction("Native summary without extension file metadata", null, 10_000);
+  assert.ok(continued.manager.getBranch().some((entry) => entry.type === "custom_message" && entry.customType === "pi-auto-handoff-context"));
+  assert.ok(!buildSessionContext(continued.manager.getBranch()).messages.some((message) => message.role === "custom" && message.customType === "pi-auto-handoff-context"));
+  assert.equal(continued.note(), undefined, "there is no local prior checkpoint to supply inherited files");
+  await continued.invoke();
+  assert.deepEqual(continued.note()?.files, { read: [], modified: ["inherited.ts"], truncated: false });
+  assert.match(continued.note()!.text, /inherited\.ts/);
 });
