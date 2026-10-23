@@ -1,4 +1,4 @@
-import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Trigger } from "./handoff.ts";
@@ -38,7 +38,7 @@ export function diagnosticRecord(value: Diagnostic) {
   return record;
 }
 
-/** One bounded backup; non-blocking cross-process lock. Stale locks drop diagnostics, never checkpoints. */
+/** One bounded backup; non-blocking cross-process lock. Abandoned locks older than 30 seconds are reclaimed once. */
 export function createDiagnostics(agentDir = getAgentDir(), maxBytes = MAX_DIAGNOSTIC_BYTES) {
   const path = join(agentDir, DIAGNOSTIC_NAME);
   const lock = `${path}.lock`;
@@ -50,7 +50,13 @@ export function createDiagnostics(agentDir = getAgentDir(), maxBytes = MAX_DIAGN
       let fd: number | undefined;
       try {
         mkdirSync(agentDir, { recursive: true, mode: 0o700 });
-        lockFd = openSync(lock, "wx", 0o600);
+        try { lockFd = openSync(lock, "wx", 0o600); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST" || Date.now() - statSync(lock).mtimeMs <= 30_000) throw error;
+          // No waiting: reclaim an abandoned writer, then retry exclusive creation once.
+          unlinkSync(lock);
+          lockFd = openSync(lock, "wx", 0o600);
+        }
         const line = `${JSON.stringify(diagnosticRecord(value))}\n`;
         if (Buffer.byteLength(line) > maxBytes) throw new Error("diagnostic record exceeds cap");
         fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);

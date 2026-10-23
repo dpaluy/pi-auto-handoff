@@ -6,8 +6,11 @@
 - Carry each continued session's inherited handoff into its next checkpoint as the previous handoff, so goals and user constraints survive successive continuations.
 - Add read-only, paginated `handoff_history` recovery restricted to the linked parent's saved source branch.
 - Add opt-in `--handoff-context-basis compaction` using file-backed settings; preserve existing window-percent defaults.
-- Render saved checkpoint cards and enrich `/handoff status` with usage, pressure policy, and diagnostics.
-- Record bounded, metadata-only lifecycle diagnostics without blocking checkpoint operations.
+- Render saved checkpoint cards with expanded Markdown and enrich `/handoff status` with usage, pressure policy, and diagnostics; direct users to status for freshness.
+- Cache file-backed compaction policy until settings metadata or model/project identity changes, avoiding repeated settings locks after every turn.
+- Keep file-list truncation separate from source evidence/output truncation.
+- Record bounded, metadata-only lifecycle diagnostics without blocking checkpoint operations; reclaim abandoned lock files after 30 seconds.
+- Run type checks and tests in GitHub Actions on Node.js 22.19 and the current LTS.
 
 ## 0.1.1 - 2026-10-13
 

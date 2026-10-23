@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ENTRY_TYPE } from "../src/handoff.ts";
-import { MAX_HISTORY_BYTES, MAX_HISTORY_CHARS, registerHandoffHistory } from "../src/history.ts";
+import { MAX_HISTORY_RETAINED_CHARS, MAX_HISTORY_CHARS, registerHandoffHistory } from "../src/history.ts";
 
 async function fixture(t: TestContext) {
   const dir = await mkdtemp(join(tmpdir(), "handoff-history-"));
@@ -156,7 +156,7 @@ test("literal search and read pages preserve bounds and paging instructions", as
   assert.doesNotMatch(next, /match item 0/);
 });
 
-test("reject invalid arguments, arbitrary paths, offsets, oversized input and cancellation", async (t) => {
+test("reject invalid arguments, arbitrary paths, offsets and cancellation", async (t) => {
   const f = await fixture(t);
   const { child } = f.checkpoint();
   for (const params of [
@@ -167,8 +167,7 @@ test("reject invalid arguments, arbitrary paths, offsets, oversized input and ca
   ]) await assert.rejects(f.run(child, params), /offset|requires|without a path/);
   const controller = new AbortController(); controller.abort();
   await assert.rejects(f.run(child, { op: "search", query: "task" }, controller.signal), { name: "AbortError" });
-  await truncate(f.parent.getSessionFile()!, MAX_HISTORY_BYTES + 1);
-  await assert.rejects(f.run(child, { op: "search", query: "task" }), /32 MiB/);
+
 });
 
 test("malformed records and cyclic/duplicate tree data fail closed", async (t) => {
@@ -183,4 +182,66 @@ test("malformed records and cyclic/duplicate tree data fail closed", async (t) =
   lines[1] = JSON.stringify(entry);
   await writeFile(path, lines.join("\n") + "\n");
   await assert.rejects(f.run(child, { op: "search", query: "task" }), /tree is invalid/);
+});
+
+test("streamed history accepts image-heavy parents larger than the old raw-file cap", async (t) => {
+  const f = await fixture(t);
+  const image = f.parent.appendMessage({ role: "user", content: [
+    { type: "text", text: "Screenshot evidence: visible error" },
+    { type: "image", data: "a".repeat(33 * 1024 * 1024), mimeType: "image/png" },
+  ], timestamp: Date.now() });
+  const { child } = f.checkpoint();
+  assert.ok((await stat(f.parent.getSessionFile()!)).size > 32 * 1024 * 1024);
+  assert.match(await f.run(child, { op: "read", entryId: image }), /Screenshot evidence: visible error/);
+});
+
+test("retained text ceiling fails closed after privacy filtering", async (t) => {
+  const f = await fixture(t);
+  f.user("retained text " + "x".repeat(MAX_HISTORY_RETAINED_CHARS));
+  const { child } = f.checkpoint();
+  await assert.rejects(f.run(child, { op: "search", query: "retained" }), /retained content exceeds 16 Mi characters/);
+});
+
+test("case-insensitive literal matching uses the same index for the result excerpt", async (t) => {
+  const f = await fixture(t);
+  f.user("prefix ".repeat(150) + "MiXeD.[LiTeRaL]" + " suffix");
+  const { child } = f.checkpoint();
+  assert.match(await f.run(child, { op: "search", query: "mixed.[literal]" }), /MiXeD\.\[LiTeRaL\]/);
+});
+
+test("validated branch cache reuses unchanged files and invalidates on size or mtime change", async (t) => {
+  const f = await fixture(t);
+  const { child } = f.checkpoint();
+  const path = f.parent.getSessionFile()!;
+  const original = await readFile(path, "utf8");
+  // Fixed exact-second mtimes make the identity check deterministic across filesystems.
+  const at = new Date("2026-01-01T00:00:00Z");
+  await utimes(path, at, at);
+  assert.match(await f.run(child, { op: "search", query: "FIRST TASK" }), /First task/);
+  const malformed = "!" + original.slice(1);
+  await writeFile(path, malformed);
+  await utimes(path, at, at);
+  // Same key must use the already validated records rather than reparsing the file.
+  assert.match(await f.run(child, { op: "read", entryId: f.first }), /First task/);
+  await utimes(path, at, new Date(at.getTime() + 1000));
+  await assert.rejects(f.run(child, { op: "search", query: "task" }), /malformed records/);
+  await writeFile(path, original);
+  await utimes(path, at, at);
+  assert.match(await f.run(child, { op: "read", entryId: f.first }), /First task/);
+  await writeFile(path, original + "not-json\n");
+  await utimes(path, at, at);
+  await assert.rejects(f.run(child, { op: "search", query: "task" }), /malformed records/);
+});
+
+test("cache hits still validate current transfer source and checkpoint content", async (t) => {
+  const f = await fixture(t);
+  const { child, note } = f.checkpoint();
+  assert.match(await f.run(child, { op: "read", entryId: f.first }), /First task/);
+  const forged = SessionManager.inMemory(f.dir, { parentSession: f.parent.getSessionFile()! });
+  forged.appendCustomMessageEntry("pi-auto-handoff-context", note.text, true,
+    { sourceSession: note.sessionId, sourceEntryId: "wrong-source", handoffId: note.id });
+  await assert.rejects(f.run(forged, { op: "search", query: "task" }), /does not match/);
+  forged.appendCustomMessageEntry("pi-auto-handoff-context", "changed checkpoint", true,
+    { sourceSession: note.sessionId, sourceEntryId: note.sourceEntryId, handoffId: note.id });
+  await assert.rejects(f.run(forged, { op: "search", query: "task" }), /does not match/);
 });

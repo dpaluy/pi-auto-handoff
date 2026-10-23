@@ -281,3 +281,18 @@ test("edits to entries after a checkpoint keep its summary and file records reus
   f.manager.appendContextEdit(root, { content: "Revised task" });
   assert.equal(snapshot(f.ctx).previousHandoffId, undefined);
 });
+
+
+test("file-list-only truncation does not claim source evidence was truncated", async () => {
+  const f = fixture(); f.user("Task");
+  const files = { read: ["kept.ts"], modified: [], truncated: true };
+  f.manager.appendCustomEntry(ENTRY_TYPE, { version: 1, id: "prior", sessionId: f.manager.getSessionId(), sourceEntryId: "entry", createdAt: "now", trigger: "manual", model: "fixture/chat", text: "Prior checkpoint", truncated: false, files });
+  const captured = snapshot(f.ctx);
+  assert.equal(captured.files?.truncated, true);
+  assert.equal(captured.truncated, false);
+  (f.ctx as any).modelRegistry = { streamSimple: () => ({ result: async () => ({ content: [{ type: "text", text: "Fresh checkpoint" }], stopReason: "stop", usage }) }) };
+  const note = await generateHandoff(f.ctx, captured, "manual", new AbortController().signal);
+  assert.equal(note.truncated, false);
+  assert.match(note.text, /File records truncated/);
+  assert.doesNotMatch(note.text, /Source evidence was truncated/);
+});

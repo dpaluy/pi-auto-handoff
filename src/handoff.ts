@@ -73,7 +73,7 @@ export function snapshot(ctx: ExtensionContext): Snapshot {
     sourceEntryId: sourceEntryId(entries) ?? "",
     leafId: ctx.sessionManager.getLeafId(),
     evidence: captured.text,
-    truncated: captured.truncated || files.truncated,
+    truncated: captured.truncated,
     hasWork: captured.hasWork,
     files,
     ...(reusable ? { previousHandoffId: reusable.id } : {}),

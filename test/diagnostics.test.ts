@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -39,4 +39,19 @@ test("diagnostics never throw on invalid targets and refuse symlink logs", (t) =
   symlinkSync(target, join(dir, DIAGNOSTIC_NAME));
   assert.equal(createDiagnostics(dir).append({ sessionId: "session", event: "start" }), false);
   assert.equal(readFileSync(target, "utf8"), "keep");
+});
+
+
+test("diagnostics reclaim abandoned locks but leave fresh locks untouched", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "diagnostics-stale-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const log = createDiagnostics(dir), path = join(dir, DIAGNOSTIC_NAME), lock = `${path}.lock`;
+  writeFileSync(lock, "abandoned");
+  const old = new Date(Date.now() - 31_000);
+  utimesSync(lock, old, old);
+  assert.equal(log.append({ sessionId: "session", event: "saved" }), true);
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).event, "saved");
+  writeFileSync(lock, "active");
+  assert.equal(log.append({ sessionId: "session", event: "failed" }), false);
+  assert.equal(readFileSync(lock, "utf8"), "active");
 });

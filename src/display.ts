@@ -1,5 +1,5 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { ENTRY_TYPE } from "./handoff.ts";
 
 const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -28,7 +28,10 @@ export function registerHandoffDisplay(pi: ExtensionAPI) {
     if (!note || note.version !== 1 || typeof note.text !== "string") return undefined;
     const heading = theme.fg("accent", "Handoff saved");
     const label = theme.fg(note.truncated === true ? "warning" : "muted", checkpointLabel(note));
-    // Stateless theme callback; Text provides native wrapping including narrow terminal widths.
-    return new Text(`${heading}\n${label}${expanded ? `\n\n${clean(note.text, 20_100)}` : "\nExpand for checkpoint details. /handoff continue"}`, 0, 0);
+    const card = new Container();
+    card.addChild(new Text(`${heading}\n${label}`, 0, 0));
+    if (expanded) card.addChild(new Markdown(clean(note.text, 20_100), 0, 0, getMarkdownTheme()));
+    else card.addChild(new Text("Expand for details; /handoff status shows freshness.", 0, 0));
+    return card;
   });
 }
