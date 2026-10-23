@@ -1,6 +1,6 @@
 # pi-auto-handoff
 
-Version **0.1.1**. [Changelog](CHANGELOG.md).
+Version **0.2.0**. [Changelog](CHANGELOG.md).
 
 Save work checkpoints after inactivity or high context use. Continue in a linked fresh Pi session when ready.
 

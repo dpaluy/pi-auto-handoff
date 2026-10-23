@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-24
 
 - Preserve head and tail evidence with provenance labels, consistent handoff section instructions, and bounded recorded file-operation lists.
 - Add read-only, paginated `handoff_history` recovery restricted to the linked parent's saved source branch.
