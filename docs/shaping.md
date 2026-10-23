@@ -89,6 +89,18 @@ Selected architecture: D combines the idle trigger from A and the context trigge
 
 D does not cancel native compaction. If Pi compacts before a checkpoint can be prepared, retain that summary as input and reevaluate at a safe boundary. It does not promise that an extension can always save the full pre-compaction context at a custom threshold.
 
+## Follow-up: evidence recovery and observability
+
+Approved after comparing pi-cached-compaction and pi-posthorse. These additions retain Shape D and supersede the corresponding initial D2–D6 details above:
+
+- **Evidence:** use effective projected entries before flattening, preserving provenance; retain head and tail of clipped blocks. Stable prompt sections are instructions rather than output schema validation. Optional bounded v1 `files` metadata and deterministic recorded-operation text carry forward file references without claiming successful writes. In a linked continuation, the inherited handoff is sent as the previous handoff (8,000-character head/tail excerpt) rather than as clipped coordination evidence, and our own continuation request is excluded from the first-request slot. A prior checkpoint or inherited handoff is reused only when no later context edit targets an entry at or before it; edits to newer entries do not discard it.
+- **Recovery:** expose read-only `handoff_history` search/read for the native linked parent's saved source branch only. Validate transfer and checkpoint identities; exclude later/sibling activity, respect context edits/omissions, and omit thinking/system/images/opaque metadata. Parent files are streamed line by line, removing private/image payloads before retaining entries; retained content including structural metadata is capped at 16 Mi characters and responses at 8,000 characters. One raw JSON line must fit in memory transiently. Cache one validated branch by parent path, size, modification time and checkpoint identity; revalidate transfer content/source identity on cache hits. Literal search is case-insensitive. Locally tampered session files are not authenticated.
+- **Pressure:** preserve the default whole-window percentage. Add opt-in `--handoff-context-basis compaction`, using file-backed settings with trusted-project/model overrides. Pi 1.0.4 lacks an effective SDK settings accessor, so this cannot account for in-memory overrides. Invalid/unknown budgets do not trigger pressure checkpoints; disabled compaction falls back to the window basis.
+- **Visibility:** render the existing checkpoint entry as an expandable card, enrich status, and write best-effort metadata-only diagnostics (1 MB plus one backup). No checkpoint evidence or raw error text enters diagnostics. Logging failure never blocks a handoff.
+- **Boundaries:** no automatic replacement, cache-policy mutation, compaction replacement, notes-file subsystem, project-wide history search, or cache-savings claim. Coexistence with third-party compaction extensions is not integration-tested.
+
+Implementation validation uses disposable session files and a local model fixture, including a real history tool invocation after linked session replacement. No paid-provider quality measurements or visual terminal verification are claimed.
+
 ## E: Automatic preparation and session replacement (not selected)
 
 E uses D1-D3 and D6, but replaces D4-D5 with automatic session creation and continuation after a context checkpoint succeeds. An idle checkpoint saves a note without starting unattended task work.
@@ -169,6 +181,6 @@ The source session remains available through parent linkage. Its saved note is n
 - **Q4 resolved for implementation:** 50 minutes idle, 70% estimated context use, native flags for adjustment/disable, active-model tool-free generation, and the budgets and suppression rules in D2/D6. The idle threshold makes no claim about cache expiry or savings.
 - **Q5 resolved for implementation:** `/handoff continue` immediately starts the next model turn, consistent with the recommended command behavior.
 
-`npm run check` and all 21 tests passed. Tests use disposable fixtures and include actual native loader, persistence, and a Pi runtime flow that saves the source note, replaces the session, and executes a local-fixture continuation. No product publication or install into the user's active Pi configuration was performed.
+At initial implementation, `npm run check` and all 21 tests passed. Tests use disposable fixtures and include actual native loader, persistence, and a Pi runtime flow that saves the source note, replaces the session, and executes a local-fixture continuation. No product publication or install into the user's active Pi configuration was performed.
 
 Remaining limits: no paid-provider summary-quality validation, no guaranteed secret redaction, no exact context telemetry, no external-file freshness guarantee, and no atomic cross-session crash recovery.
