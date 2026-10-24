@@ -3,15 +3,16 @@ import { ENTRY_TYPE, generateHandoff, latestHandoff, REQUEST_TIMEOUT_MS, RETRY_D
 import { registerHandoffHistory } from "./history.ts";
 import { registerHandoffDisplay, checkpointLabel } from "./display.ts";
 import { createDiagnostics, type DiagnosticReason } from "./diagnostics.ts";
-import { pressureBasis, pressureState } from "./pressure.ts";
+import { pressureState } from "./pressure.ts";
+import { describeSettings, parseSetting, parseSetupArgs, resetSettings, resolveSettings, saveSettings, SETTINGS, type SettingKey } from "./config.ts";
 import { CONTINUATION_PROMPT, TRANSFER_TYPE, validRecordedFiles } from "./evidence.ts";
 
 const STATUS_KEY = "auto-handoff";
 
 export default function autoHandoff(pi: ExtensionAPI) {
-  pi.registerFlag("handoff-idle-minutes", { type: "string", default: "50", description: "Idle checkpoint delay (0 disables; default 50 minutes)" });
-  pi.registerFlag("handoff-context-percent", { type: "string", default: "70", description: "Estimated context checkpoint threshold (0 disables; default 70 percent)" });
-  pi.registerFlag("handoff-context-basis", { type: "string", default: "window", description: "Pressure basis: window (default) or configured file-backed compaction budget" });
+  pi.registerFlag("handoff-idle-minutes", { type: "string", description: "Idle checkpoint delay (0 disables; overrides /handoff setup; default 50 minutes)" });
+  pi.registerFlag("handoff-context-percent", { type: "string", description: "Estimated context checkpoint threshold (0 disables; overrides /handoff setup; default 70 percent)" });
+  pi.registerFlag("handoff-context-basis", { type: "string", description: "Pressure basis: window (default) or configured file-backed compaction budget; overrides /handoff setup" });
   registerHandoffHistory(pi);
   registerHandoffDisplay(pi);
   const diagnostics = createDiagnostics();
@@ -36,14 +37,7 @@ export default function autoHandoff(pi: ExtensionAPI) {
     clearTimeout(timer); timer = undefined;
     request?.abort(); request = undefined;
   };
-  const numberFlag = (name: string, max: number) => {
-    const raw = pi.getFlag(name);
-    const value = Number(raw);
-    if (typeof raw !== "string" || !raw.trim() || !Number.isFinite(value) || value < 0 || value > max) {
-      throw new Error(`--${name} must be a number between 0 and ${max}.`);
-    }
-    return value;
-  };
+  const settings = () => resolveSettings((name) => pi.getFlag(name));
   const saved = (ctx: ExtensionContext) => latestHandoff(ctx.sessionManager.getBranch(), failedNotes);
   const current = (ctx: ExtensionContext, note: Handoff) => note.sessionId === ctx.sessionManager.getSessionId()
     && note.sourceEntryId === sourceEntryId(ctx.sessionManager.getBranch());
@@ -165,9 +159,8 @@ export default function autoHandoff(pi: ExtensionAPI) {
       timer = undefined;
       if (lifetime !== epoch || !eligible(ctx) || commandBusy || request) return;
       try {
-        const threshold = numberFlag("handoff-context-percent", 100);
-        const minutes = numberFlag("handoff-idle-minutes", 1_440);
-        const pressure = pressureState(ctx, threshold, pressureBasis(pi.getFlag("handoff-context-basis")));
+        const { idleMinutes: minutes, contextPercent: threshold, contextBasis } = settings().values;
+        const pressure = pressureState(ctx, threshold, contextBasis);
         const high = pressure.high;
         if (!high) pressureAttempted = false;
         const note = saved(ctx);
@@ -236,19 +229,57 @@ export default function autoHandoff(pi: ExtensionAPI) {
     }
   }
 
+  async function setup(ctx: ExtensionCommandContext, args: string) {
+    try {
+      if (args === "reset") resetSettings();
+      else if (args) saveSettings(parseSetupArgs(args));
+      else if (!ctx.hasUI) { report(ctx, describeSettings(settings())); return; }
+      else {
+        while (true) {
+          const resolved = settings();
+          const keys = Object.keys(SETTINGS) as SettingKey[];
+          const options = [...keys.map((key) => `${SETTINGS[key].label}: ${resolved.values[key]} (${resolved.sources[key]})`), "Reset to defaults", "Done"];
+          const choice = await ctx.ui.select("Handoff setup (CLI flags override saved values)", options);
+          const index = choice === undefined ? -1 : options.indexOf(choice);
+          if (index < 0 || index === options.length - 1) break;
+          if (index === keys.length) { resetSettings(); continue; }
+          const key = keys[index]!;
+          const value = key === "contextBasis"
+            ? await ctx.ui.select(SETTINGS[key].label, ["window", "compaction"])
+            : await ctx.ui.input(`${SETTINGS[key].label} (0–${SETTINGS[key].max}, 0 disables)`, String(resolved.values[key]));
+          if (value === undefined || !value.trim()) continue;
+          try { saveSettings({ [key]: parseSetting(key, value.trim()) }); }
+          catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Invalid value.", "error"); }
+        }
+      }
+      const resolved = settings();
+      report(ctx, `Handoff settings saved.\n${describeSettings(resolved)}`);
+      // Apply immediately: restart the idle timer with the new policy.
+      // Never abort an in-flight checkpoint; it picks up the new policy next turn.
+      if (!request && !commandBusy) { clearTimeout(timer); timer = undefined; idleAttempted = false; pressureAttempted = false; schedule(ctx); }
+    } catch (error) {
+      report(ctx, error instanceof Error ? error.message : "Handoff settings could not be saved.", true);
+    }
+  }
+
   pi.registerCommand("handoff", {
     description: "Save a checkpoint, show status, or continue in a linked fresh session",
     handler: async (args, ctx) => {
       const action = args.trim();
-      if (!["", "continue", "status"].includes(action)) { report(ctx, "Use /handoff, /handoff status, or /handoff continue."); return; }
+      if (action === "setup" || action.startsWith("setup ")) { await setup(ctx, action.slice(5).trim()); return; }
+      if (!["", "continue", "status"].includes(action)) { report(ctx, "Use /handoff, /handoff status, /handoff continue, or /handoff setup."); return; }
       if (action === "status") {
         const note = saved(ctx);
         let pressure: string;
-        try { pressure = pressureState(ctx, numberFlag("handoff-context-percent", 100), pressureBasis(pi.getFlag("handoff-context-basis"))).description; }
-        catch (error) { pressure = error instanceof Error ? error.message : "Pressure settings unavailable."; }
+        let configured = "";
+        try {
+          const resolved = settings();
+          configured = describeSettings(resolved);
+          pressure = pressureState(ctx, resolved.values.contextPercent, resolved.values.contextBasis).description;
+        } catch (error) { pressure = error instanceof Error ? error.message : "Pressure settings unavailable."; }
         report(ctx, [request ? "Preparing handoff." : note
           ? `Last handoff: ${checkpointLabel(note)} (${current(ctx, note) ? "current" : "stale"}). /handoff continue refreshes stale notes.`
-          : "No saved handoff on this branch.", pressure, diagnostics.status()].join("\n"));
+          : "No saved handoff on this branch.", pressure, configured, diagnostics.status()].filter(Boolean).join("\n"));
         return;
       }
       if (commandBusy) { report(ctx, "A handoff command is already running."); return; }

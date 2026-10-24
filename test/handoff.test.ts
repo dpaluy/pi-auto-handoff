@@ -574,3 +574,31 @@ test("first checkpoint after continuation and native compaction retains inherite
   assert.deepEqual(continued.note()?.files, { read: [], modified: ["inherited.ts"], truncated: false });
   assert.match(continued.note()!.text, /inherited\.ts/);
 });
+
+test("/handoff setup saves settings, status shows sources, flags override, and new idle policy applies", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  await f.invoke("setup idle=1 basis=window");
+  assert.match(f.notices.at(-1)!, /Idle minutes: 1 \(saved\)/);
+  assert.equal(JSON.parse(await readFile(join(f.dir, "auto-handoff.json"), "utf8")).idleMinutes, 1);
+  t.mock.timers.tick(0); t.mock.timers.tick(60_000); await flush();
+  assert.equal(f.note()?.trigger, "idle");
+  f.flags.set("handoff-idle-minutes", "0");
+  await f.invoke("status");
+  assert.match(f.notices.at(-1)!, /Idle minutes: 0 \(flag\)/);
+  assert.match(f.notices.at(-1)!, /Context percent: 70 \(default\)/);
+  await f.invoke("setup percent=500");
+  assert.match(f.notices.at(-1)!, /between 0 and 100/);
+  await f.invoke("setup reset");
+  assert.match(f.notices.at(-1)!, /Context basis: window \(default\)/);
+});
+
+test("interactive /handoff setup edits values through Pi dialogs", async (t) => {
+  const f = await fixture(t);
+  const picks = ["Context basis: window (default)", "compaction", "Context percent: 70 (default)", "Done"];
+  f.ctx.ui.select = async (_title: string, options: string[]) => { const pick = picks.shift(); assert.ok(options.includes(pick!)); return pick; };
+  f.ctx.ui.input = async () => "85";
+  await f.invoke("setup");
+  assert.deepEqual(JSON.parse(await readFile(join(f.dir, "auto-handoff.json"), "utf8")), { contextPercent: 85, contextBasis: "compaction" });
+  assert.match(f.notices.at(-1)!, /Context percent: 85 \(saved\)/);
+});
