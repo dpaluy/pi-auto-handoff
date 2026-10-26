@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -9,6 +9,7 @@ import {
   ModelRuntime, SessionManager, SettingsManager,
   type AgentSession, type CreateAgentSessionRuntimeFactory, type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { diagnosticsDir } from "../src/diagnostics.ts";
 import { latestHandoff } from "../src/handoff.ts";
 
 test("real Pi runtime saves, replaces, and continues using the local extension artifact", async () => {
@@ -17,6 +18,8 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
   const requests: string[] = [];
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
+  // Diagnostics are opt-in; enable through the saved settings file a user would create.
+  await writeFile(join(dir, "auto-handoff.json"), JSON.stringify({ diagnostics: true }));
   let sourceEntryId = "";
   let recoveredHistory = false;
   const provider = (pi: ExtensionAPI) => pi.registerProvider("handoff-fixture", {
@@ -95,7 +98,7 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
     assert.equal(recoveredHistory, true, "fresh continuation recovered source evidence with a real tool call");
     assert.equal(latestHandoff(SessionManager.open(sourceFile).getBranch())?.id, note.id);
     assert.deepEqual(errors, []);
-    const log = await readFile(join(dir, "auto-handoff.jsonl"), "utf8");
+    const log = await readFile(join(diagnosticsDir(dir, dir), "diagnostics.jsonl"), "utf8");
     assert.deepEqual(log.trim().split("\n").map((line) => JSON.parse(line).event), ["start", "saved"]);
     assert.doesNotMatch(log, /Do not deploy|Fix the feature|Read current source|evidence"|text"/);
   } finally {

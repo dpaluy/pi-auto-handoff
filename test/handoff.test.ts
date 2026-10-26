@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { buildSessionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { loadExtensions } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
 import extension from "../src/index.ts";
+import { diagnosticsDir } from "../src/diagnostics.ts";
 import { ENTRY_TYPE, latestHandoff, MAX_INPUT_CHARS, REQUEST_TIMEOUT_MS, RETRY_DELAY_MS, snapshot } from "../src/handoff.ts";
 
 const flush = async () => { for (let i = 0; i < 5; i++) await new Promise<void>((done) => setImmediate(done)); };
@@ -96,6 +97,7 @@ async function fixture(t: TestContext, ephemeral = false, initial?: SessionManag
     sendMessage: forbidden, sendUserMessage: forbidden, exec: forbidden,
   };
   extension(pi);
+  flags.set("handoff-diagnostics", "on");
   const addUser = (text: string) => manager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
   const firstUser = addUser("Implement the feature. Preserve user edits. Do not deploy.");
   manager.appendMessage({ ...response("Tests failed: expected 2, got 1. Next: inspect the condition."), api: model.api, provider: model.provider, model: model.id, timestamp: Date.now() } as any);
@@ -107,7 +109,7 @@ async function fixture(t: TestContext, ephemeral = false, initial?: SessionManag
   return {
     dir, manager, ctx, calls, notices, statuses, flags, handlers, firstUser, addUser, tools, renderers,
     diagnostics: async () => {
-      try { return (await readFile(join(dir, "auto-handoff.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line)); }
+      try { return (await readFile(join(diagnosticsDir(dir, dir), "diagnostics.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line)); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
     },
     invoke: (args = "") => commands.get("handoff").handler(args, ctx),
@@ -486,7 +488,8 @@ test("save failure does not switch or hide the previous checkpoint", async (t) =
 
 test("diagnostic contention cannot prevent checkpoint persistence", async (t) => {
   const f = await fixture(t);
-  await writeFile(join(f.dir, "auto-handoff.jsonl.lock"), "another writer");
+  await mkdir(diagnosticsDir(f.dir, f.dir), { recursive: true });
+  await writeFile(join(diagnosticsDir(f.dir, f.dir), "diagnostics.jsonl.lock"), "another writer");
   await f.invoke();
   assert.ok(f.note());
   assert.equal(checkpointCount(f.manager), 1);
@@ -573,4 +576,56 @@ test("first checkpoint after continuation and native compaction retains inherite
   await continued.invoke();
   assert.deepEqual(continued.note()?.files, { read: [], modified: ["inherited.ts"], truncated: false });
   assert.match(continued.note()!.text, /inherited\.ts/);
+});
+
+test("/handoff setup saves settings, status shows sources, flags override, and new idle policy applies", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const f = await fixture(t);
+  await f.invoke("setup idle=1 basis=window");
+  assert.match(f.notices.at(-1)!, /Idle minutes: 1 \(saved\)/);
+  assert.equal(JSON.parse(await readFile(join(f.dir, "auto-handoff.json"), "utf8")).idleMinutes, 1);
+  t.mock.timers.tick(0); t.mock.timers.tick(60_000); await flush();
+  assert.equal(f.note()?.trigger, "idle");
+  f.flags.set("handoff-idle-minutes", "0");
+  await f.invoke("status");
+  assert.match(f.notices.at(-1)!, /Idle minutes: 0 \(flag\)/);
+  assert.match(f.notices.at(-1)!, /Context percent: 70 \(default\)/);
+  await f.invoke("setup percent=500");
+  assert.match(f.notices.at(-1)!, /between 0 and 100/);
+  await f.invoke("setup reset");
+  assert.match(f.notices.at(-1)!, /Context basis: window \(default\)/);
+});
+
+test("interactive /handoff setup edits values through Pi dialogs", async (t) => {
+  const f = await fixture(t);
+  const picks = ["Context basis: window (default)", "compaction", "Context percent: 70 (default)", "Done"];
+  f.ctx.ui.select = async (_title: string, options: string[]) => { const pick = picks.shift(); assert.ok(options.includes(pick!)); return pick; };
+  f.ctx.ui.input = async () => "85";
+  await f.invoke("setup");
+  assert.deepEqual(JSON.parse(await readFile(join(f.dir, "auto-handoff.json"), "utf8")), { contextPercent: 85, contextBasis: "compaction" });
+  assert.match(f.notices.at(-1)!, /Context percent: 85 \(saved\)/);
+});
+
+test("diagnostics are off by default and write no file", async (t) => {
+  const f = await fixture(t); f.flags.delete("handoff-diagnostics");
+  await f.invoke(); assert.ok(f.note());
+  assert.deepEqual(await f.diagnostics(), []);
+  await f.invoke("status");
+  assert.match(f.notices.at(-1)!, /Diagnostics: off/);
+  assert.match(f.notices.at(-1)!, /Diagnostics log: off \(default\)/);
+  await f.invoke("setup diagnostics=on");
+  f.addUser("More work."); await f.invoke();
+  assert.deepEqual((await f.diagnostics()).map((record) => record.event), ["start", "saved"]);
+});
+
+test("diagnostics go to a per-project folder under the agent dir and clear-logs removes them", async (t) => {
+  const f = await fixture(t);
+  await f.invoke(); assert.ok(f.note());
+  const dir = diagnosticsDir(f.dir, f.dir);
+  assert.ok(dir.startsWith(join(f.dir, "auto-handoff", "--")));
+  assert.equal((await f.diagnostics()).length, 2);
+  await assert.rejects(stat(join(f.dir, "auto-handoff.jsonl")), /ENOENT/, "no shared global log");
+  await f.invoke("setup clear-logs");
+  assert.match(f.notices.at(-1)!, /Deleted this project's handoff diagnostics/);
+  await assert.rejects(stat(dir), /ENOENT/);
 });

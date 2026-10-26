@@ -1,6 +1,6 @@
 # pi-auto-handoff
 
-Version **0.2.0**. [Changelog](CHANGELOG.md).
+Version **0.3.0**. [Changelog](CHANGELOG.md).
 
 Save work checkpoints after inactivity or high context use. Continue in a linked fresh Pi session when ready.
 
@@ -29,6 +29,7 @@ Restart Pi or run `/reload`.
 | `/handoff` | Save a checkpoint. |
 | `/handoff status` | Show checkpoint status. |
 | `/handoff continue` | Refresh if needed, start a linked fresh session, and continue immediately. |
+| `/handoff setup` | Choose and save automatic-checkpoint settings. |
 
 Checkpoints are saved in Pi's session file, not project files. The original session remains available through `/resume`. Native compaction and cache warming are unchanged. Compatibility with other compaction-policy extensions has not been integration-tested.
 
@@ -46,7 +47,16 @@ After `/handoff continue`, the model can use `handoff_history` to search case-in
 
 Defaults: **50 idle minutes** or **70% estimated context use**. Automatic checkpoints run in TUI and RPC modes with saved sessions. Session replacement always requires `/handoff continue`.
 
-Change thresholds when starting Pi:
+Change and save thresholds with `/handoff setup`, which opens a picker in the TUI. Or pass values directly (works in RPC mode too):
+
+```sh
+/handoff setup idle=30 percent=80 basis=compaction diagnostics=on
+/handoff setup reset
+```
+
+Saved settings live in `~/.pi/agent/auto-handoff.json` (private permissions, replaced atomically) and apply immediately. Pi's own `settings.json` is not touched. An invalid saved value is ignored with a warning in `/handoff status`, which also shows where each value came from (`flag`, `saved`, or `default`).
+
+Flags override saved settings for one launch:
 
 ```sh
 pi --handoff-idle-minutes 30 --handoff-context-percent 80
@@ -68,7 +78,7 @@ Each checkpoint request has a **120-second timeout**. On timeout, the extension 
 
 Checkpoint generation sends bounded session text to the active model provider. Provider charges or subscription limits can apply. Notes and retrieved history can contain sensitive information; secret removal is not guaranteed. Retrieved history enters the continuing model's context.
 
-Best-effort diagnostic metadata is stored at Pi's agent directory (`~/.pi/agent/auto-handoff.jsonl` by default), capped at 1 MB plus one rotated backup. It records checkpoint outcomes, timing, truncation, and available usage—not evidence, note text, file paths, or raw errors. Files use private permissions. Contention or write failures may drop records but never prevent checkpointing. A `.lock` file left by a crash is reclaimed on a later append once it is older than 30 seconds; fresh locks still cause records to be dropped rather than waiting.
+Diagnostics are **off by default**. Enable them with `/handoff setup diagnostics=on` (or `--handoff-diagnostics on` for one launch) to debug skipped or failed checkpoints. Each project gets its own log under Pi's agent directory, named like its session folder: `~/.pi/agent/auto-handoff/<project>/diagnostics.jsonl`. Nothing is written into the project. Each log is capped at 1 MB plus one rotated backup, so the oldest lines of that project are dropped first. It records checkpoint outcomes, timing, truncation, and available usage—not evidence, note text, file paths, or raw errors. Files use private permissions. Delete the current project's log with `/handoff setup clear-logs`; turning diagnostics off in the picker offers to delete it. Contention or write failures may drop records but never prevent checkpointing. A `.lock` file left by a crash is reclaimed on a later append once it is older than 30 seconds; fresh locks still cause records to be dropped rather than waiting.
 
 ## License
 

@@ -1,10 +1,22 @@
-import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Trigger } from "./handoff.ts";
 
 export const MAX_DIAGNOSTIC_BYTES = 1_000_000;
-export const DIAGNOSTIC_NAME = "auto-handoff.jsonl";
+export const DIAGNOSTIC_NAME = "diagnostics.jsonl";
+
+/** One folder per project, named like Pi's own `sessions/<project>` folders; nothing is written into the project. */
+export function diagnosticsDir(cwd: string, agentDir = getAgentDir()): string {
+  const safe = `--${resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  return join(resolve(agentDir), "auto-handoff", safe);
+}
+
+/** Removes one project's log, backup, and lock. */
+export function clearDiagnostics(dir: string) {
+  for (const name of [DIAGNOSTIC_NAME, `${DIAGNOSTIC_NAME}.1`, `${DIAGNOSTIC_NAME}.lock`]) rmSync(join(dir, name), { force: true });
+  try { rmdirSync(dir); } catch {}
+}
 export type DiagnosticEvent = "start" | "retry" | "saved" | "failed" | "cancelled" | "skipped";
 export type DiagnosticReason = "timeout" | "generation" | "persistence" | "session_changed" | "no_work" | "late_wake";
 export interface Diagnostic {
@@ -39,8 +51,8 @@ export function diagnosticRecord(value: Diagnostic) {
 }
 
 /** One bounded backup; non-blocking cross-process lock. Abandoned locks older than 30 seconds are reclaimed once. */
-export function createDiagnostics(agentDir = getAgentDir(), maxBytes = MAX_DIAGNOSTIC_BYTES) {
-  const path = join(agentDir, DIAGNOSTIC_NAME);
+export function createDiagnostics(dir: string, maxBytes = MAX_DIAGNOSTIC_BYTES) {
+  const path = join(dir, DIAGNOSTIC_NAME);
   const lock = `${path}.lock`;
   let availability = "not yet attempted";
   return {
@@ -49,7 +61,7 @@ export function createDiagnostics(agentDir = getAgentDir(), maxBytes = MAX_DIAGN
       let lockFd: number | undefined;
       let fd: number | undefined;
       try {
-        mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
         try { lockFd = openSync(lock, "wx", 0o600); }
         catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST" || Date.now() - statSync(lock).mtimeMs <= 30_000) throw error;
