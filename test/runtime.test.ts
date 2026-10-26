@@ -9,6 +9,7 @@ import {
   ModelRuntime, SessionManager, SettingsManager,
   type AgentSession, type CreateAgentSessionRuntimeFactory, type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { diagnosticsDir } from "../src/diagnostics.ts";
 import { latestHandoff } from "../src/handoff.ts";
 
 test("real Pi runtime saves, replaces, and continues using the local extension artifact", async () => {
@@ -97,7 +98,7 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
     assert.equal(recoveredHistory, true, "fresh continuation recovered source evidence with a real tool call");
     assert.equal(latestHandoff(SessionManager.open(sourceFile).getBranch())?.id, note.id);
     assert.deepEqual(errors, []);
-    const log = await readFile(join(dir, "auto-handoff.jsonl"), "utf8");
+    const log = await readFile(join(diagnosticsDir(dir, dir), "diagnostics.jsonl"), "utf8");
     assert.deepEqual(log.trim().split("\n").map((line) => JSON.parse(line).event), ["start", "saved"]);
     assert.doesNotMatch(log, /Do not deploy|Fix the feature|Read current source|evidence"|text"/);
   } finally {

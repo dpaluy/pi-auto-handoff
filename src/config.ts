@@ -97,7 +97,7 @@ export function parseSetupArgs(text: string): Partial<HandoffSettings> {
   for (const part of text.split(/\s+/).filter(Boolean)) {
     const [name, value, extra] = part.split("=");
     const key = aliases[name ?? ""];
-    if (!key || value === undefined || extra !== undefined) throw new Error("Use /handoff setup idle=<minutes> percent=<0-100> basis=window|compaction diagnostics=on|off, or /handoff setup reset.");
+    if (!key || value === undefined || extra !== undefined) throw new Error("Use /handoff setup idle=<minutes> percent=<0-100> basis=window|compaction diagnostics=on|off, /handoff setup reset, or /handoff setup clear-logs.");
     update[key] = parseSetting(key, value);
   }
   return update as Partial<HandoffSettings>;

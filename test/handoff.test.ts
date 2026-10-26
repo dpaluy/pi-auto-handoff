@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { buildSessionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { loadExtensions } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
 import extension from "../src/index.ts";
+import { diagnosticsDir } from "../src/diagnostics.ts";
 import { ENTRY_TYPE, latestHandoff, MAX_INPUT_CHARS, REQUEST_TIMEOUT_MS, RETRY_DELAY_MS, snapshot } from "../src/handoff.ts";
 
 const flush = async () => { for (let i = 0; i < 5; i++) await new Promise<void>((done) => setImmediate(done)); };
@@ -108,7 +109,7 @@ async function fixture(t: TestContext, ephemeral = false, initial?: SessionManag
   return {
     dir, manager, ctx, calls, notices, statuses, flags, handlers, firstUser, addUser, tools, renderers,
     diagnostics: async () => {
-      try { return (await readFile(join(dir, "auto-handoff.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line)); }
+      try { return (await readFile(join(diagnosticsDir(dir, dir), "diagnostics.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line)); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
     },
     invoke: (args = "") => commands.get("handoff").handler(args, ctx),
@@ -487,7 +488,8 @@ test("save failure does not switch or hide the previous checkpoint", async (t) =
 
 test("diagnostic contention cannot prevent checkpoint persistence", async (t) => {
   const f = await fixture(t);
-  await writeFile(join(f.dir, "auto-handoff.jsonl.lock"), "another writer");
+  await mkdir(diagnosticsDir(f.dir, f.dir), { recursive: true });
+  await writeFile(join(diagnosticsDir(f.dir, f.dir), "diagnostics.jsonl.lock"), "another writer");
   await f.invoke();
   assert.ok(f.note());
   assert.equal(checkpointCount(f.manager), 1);
@@ -614,4 +616,16 @@ test("diagnostics are off by default and write no file", async (t) => {
   await f.invoke("setup diagnostics=on");
   f.addUser("More work."); await f.invoke();
   assert.deepEqual((await f.diagnostics()).map((record) => record.event), ["start", "saved"]);
+});
+
+test("diagnostics go to a per-project folder under the agent dir and clear-logs removes them", async (t) => {
+  const f = await fixture(t);
+  await f.invoke(); assert.ok(f.note());
+  const dir = diagnosticsDir(f.dir, f.dir);
+  assert.ok(dir.startsWith(join(f.dir, "auto-handoff", "--")));
+  assert.equal((await f.diagnostics()).length, 2);
+  await assert.rejects(stat(join(f.dir, "auto-handoff.jsonl")), /ENOENT/, "no shared global log");
+  await f.invoke("setup clear-logs");
+  assert.match(f.notices.at(-1)!, /Deleted this project's handoff diagnostics/);
+  await assert.rejects(stat(dir), /ENOENT/);
 });

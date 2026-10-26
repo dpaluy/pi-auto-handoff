@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createDiagnostics, diagnosticRecord, DIAGNOSTIC_NAME } from "../src/diagnostics.ts";
+import { createDiagnostics, diagnosticRecord, diagnosticsDir, DIAGNOSTIC_NAME } from "../src/diagnostics.ts";
 
 test("diagnostics serialize only finite allowlisted metadata", () => {
   const record = diagnosticRecord({ sessionId: "safe-id", event: "saved", reason: "generation", trigger: "idle", cost: NaN,
@@ -54,4 +54,9 @@ test("diagnostics reclaim abandoned locks but leave fresh locks untouched", (t) 
   writeFileSync(lock, "active");
   assert.equal(log.append({ sessionId: "session", event: "failed" }), false);
   assert.equal(readFileSync(lock, "utf8"), "active");
+});
+
+test("diagnostics folders follow Pi's session-folder naming per project", () => {
+  assert.equal(diagnosticsDir("/Users/me/work/app", "/agent"), join("/agent", "auto-handoff", "--Users-me-work-app--"));
+  assert.notEqual(diagnosticsDir("/a/one", "/agent"), diagnosticsDir("/a/two", "/agent"));
 });
