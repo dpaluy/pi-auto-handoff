@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -17,6 +17,8 @@ test("real Pi runtime saves, replaces, and continues using the local extension a
   const requests: string[] = [];
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
+  // Diagnostics are opt-in; enable through the saved settings file a user would create.
+  await writeFile(join(dir, "auto-handoff.json"), JSON.stringify({ diagnostics: true }));
   let sourceEntryId = "";
   let recoveredHistory = false;
   const provider = (pi: ExtensionAPI) => pi.registerProvider("handoff-fixture", {

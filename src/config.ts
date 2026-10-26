@@ -5,20 +5,28 @@ import type { PressureBasis } from "./pressure.ts";
 
 export const CONFIG_NAME = "auto-handoff.json";
 
-export interface HandoffSettings { idleMinutes: number; contextPercent: number; contextBasis: PressureBasis }
+export interface HandoffSettings { idleMinutes: number; contextPercent: number; contextBasis: PressureBasis; diagnostics: boolean }
 export type SettingKey = keyof HandoffSettings;
 export type SettingSource = "flag" | "saved" | "default";
 
-export const SETTINGS: Record<SettingKey, { flag: string; label: string; fallback: number | PressureBasis; max?: number }> = {
+type SettingValue = number | PressureBasis | boolean;
+export const SETTINGS: Record<SettingKey, { flag: string; label: string; fallback: SettingValue; max?: number }> = {
   idleMinutes: { flag: "handoff-idle-minutes", label: "Idle minutes", fallback: 50, max: 1_440 },
   contextPercent: { flag: "handoff-context-percent", label: "Context percent", fallback: 70, max: 100 },
   contextBasis: { flag: "handoff-context-basis", label: "Context basis", fallback: "window" },
+  diagnostics: { flag: "handoff-diagnostics", label: "Diagnostics log", fallback: false },
 };
 const KEYS = Object.keys(SETTINGS) as SettingKey[];
 
 /** Validates one value from any source; throws a user-facing message. */
-export function parseSetting(key: SettingKey, raw: unknown): number | PressureBasis {
+export function parseSetting(key: SettingKey, raw: unknown): SettingValue {
   const spec = SETTINGS[key];
+  if (key === "diagnostics") {
+    if (typeof raw === "boolean") return raw;
+    if (raw === "on" || raw === "true") return true;
+    if (raw === "off" || raw === "false") return false;
+    throw new Error(`${spec.label} must be on or off.`);
+  }
   if (key === "contextBasis") {
     if (raw !== "window" && raw !== "compaction") throw new Error(`${spec.label} must be window or compaction.`);
     return raw;
@@ -52,7 +60,7 @@ function readSaved(agentDir: string): { values: Partial<HandoffSettings>; warnin
 /** Precedence: explicit CLI flag, then saved file, then built-in default. Invalid flags throw. */
 export function resolveSettings(getFlag: (name: string) => unknown, agentDir = getAgentDir()) {
   const saved = readSaved(agentDir);
-  const values = {} as Record<SettingKey, number | PressureBasis>;
+  const values = {} as Record<SettingKey, SettingValue>;
   const sources = {} as Record<SettingKey, SettingSource>;
   for (const key of KEYS) {
     const raw = getFlag(SETTINGS[key].flag);
@@ -82,21 +90,23 @@ export function saveSettings(update: Partial<HandoffSettings>, agentDir = getAge
 
 export function resetSettings(agentDir = getAgentDir()) { rmSync(configPath(agentDir), { force: true }); }
 
-/** Parses `idle=30 percent=80 basis=compaction`. */
+/** Parses `idle=30 percent=80 basis=compaction diagnostics=on`. */
 export function parseSetupArgs(text: string): Partial<HandoffSettings> {
-  const aliases: Record<string, SettingKey> = { idle: "idleMinutes", percent: "contextPercent", basis: "contextBasis" };
+  const aliases: Record<string, SettingKey> = { idle: "idleMinutes", percent: "contextPercent", basis: "contextBasis", diagnostics: "diagnostics" };
   const update: Partial<Record<SettingKey, unknown>> = {};
   for (const part of text.split(/\s+/).filter(Boolean)) {
     const [name, value, extra] = part.split("=");
     const key = aliases[name ?? ""];
-    if (!key || value === undefined || extra !== undefined) throw new Error("Use /handoff setup idle=<minutes> percent=<0-100> basis=window|compaction, or /handoff setup reset.");
+    if (!key || value === undefined || extra !== undefined) throw new Error("Use /handoff setup idle=<minutes> percent=<0-100> basis=window|compaction diagnostics=on|off, or /handoff setup reset.");
     update[key] = parseSetting(key, value);
   }
   return update as Partial<HandoffSettings>;
 }
 
+export const formatSetting = (value: SettingValue) => typeof value === "boolean" ? (value ? "on" : "off") : String(value);
+
 export function describeSettings(resolved: ReturnType<typeof resolveSettings>): string {
-  const lines = KEYS.map((key) => `${SETTINGS[key].label}: ${resolved.values[key]} (${resolved.sources[key]})`);
+  const lines = KEYS.map((key) => `${SETTINGS[key].label}: ${formatSetting(resolved.values[key])} (${resolved.sources[key]})`);
   if (resolved.warning) lines.push(resolved.warning);
   return lines.join("\n");
 }

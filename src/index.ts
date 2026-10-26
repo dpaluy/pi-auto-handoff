@@ -4,7 +4,7 @@ import { registerHandoffHistory } from "./history.ts";
 import { registerHandoffDisplay, checkpointLabel } from "./display.ts";
 import { createDiagnostics, type DiagnosticReason } from "./diagnostics.ts";
 import { pressureState } from "./pressure.ts";
-import { describeSettings, parseSetting, parseSetupArgs, resetSettings, resolveSettings, saveSettings, SETTINGS, type SettingKey } from "./config.ts";
+import { describeSettings, formatSetting, parseSetting, parseSetupArgs, resetSettings, resolveSettings, saveSettings, SETTINGS, type SettingKey } from "./config.ts";
 import { CONTINUATION_PROMPT, TRANSFER_TYPE, validRecordedFiles } from "./evidence.ts";
 
 const STATUS_KEY = "auto-handoff";
@@ -13,9 +13,10 @@ export default function autoHandoff(pi: ExtensionAPI) {
   pi.registerFlag("handoff-idle-minutes", { type: "string", description: "Idle checkpoint delay (0 disables; overrides /handoff setup; default 50 minutes)" });
   pi.registerFlag("handoff-context-percent", { type: "string", description: "Estimated context checkpoint threshold (0 disables; overrides /handoff setup; default 70 percent)" });
   pi.registerFlag("handoff-context-basis", { type: "string", description: "Pressure basis: window (default) or configured file-backed compaction budget; overrides /handoff setup" });
+  pi.registerFlag("handoff-diagnostics", { type: "string", description: "Metadata-only diagnostics log: on or off (default off); overrides /handoff setup" });
   registerHandoffHistory(pi);
   registerHandoffDisplay(pi);
-  const diagnostics = createDiagnostics();
+  const log = createDiagnostics();
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let request: AbortController | undefined;
@@ -38,6 +39,12 @@ export default function autoHandoff(pi: ExtensionAPI) {
     request?.abort(); request = undefined;
   };
   const settings = () => resolveSettings((name) => pi.getFlag(name));
+  // Opt-in: nothing is written unless enabled. Unreadable settings disable logging, never checkpoints.
+  const loggingEnabled = () => { try { return settings().values.diagnostics; } catch { return false; } };
+  const diagnostics = {
+    append: (value: Parameters<typeof log.append>[0]) => loggingEnabled() && log.append(value),
+    status: () => loggingEnabled() ? log.status() : "Diagnostics: off (enable with /handoff setup diagnostics=on).",
+  };
   const saved = (ctx: ExtensionContext) => latestHandoff(ctx.sessionManager.getBranch(), failedNotes);
   const current = (ctx: ExtensionContext, note: Handoff) => note.sessionId === ctx.sessionManager.getSessionId()
     && note.sourceEntryId === sourceEntryId(ctx.sessionManager.getBranch());
@@ -238,14 +245,14 @@ export default function autoHandoff(pi: ExtensionAPI) {
         while (true) {
           const resolved = settings();
           const keys = Object.keys(SETTINGS) as SettingKey[];
-          const options = [...keys.map((key) => `${SETTINGS[key].label}: ${resolved.values[key]} (${resolved.sources[key]})`), "Reset to defaults", "Done"];
+          const options = [...keys.map((key) => `${SETTINGS[key].label}: ${formatSetting(resolved.values[key])} (${resolved.sources[key]})`), "Reset to defaults", "Done"];
           const choice = await ctx.ui.select("Handoff setup (CLI flags override saved values)", options);
           const index = choice === undefined ? -1 : options.indexOf(choice);
           if (index < 0 || index === options.length - 1) break;
           if (index === keys.length) { resetSettings(); continue; }
           const key = keys[index]!;
-          const value = key === "contextBasis"
-            ? await ctx.ui.select(SETTINGS[key].label, ["window", "compaction"])
+          const value = key === "contextBasis" ? await ctx.ui.select(SETTINGS[key].label, ["window", "compaction"])
+            : key === "diagnostics" ? await ctx.ui.select(SETTINGS[key].label, ["off", "on"])
             : await ctx.ui.input(`${SETTINGS[key].label} (0–${SETTINGS[key].max}, 0 disables)`, String(resolved.values[key]));
           if (value === undefined || !value.trim()) continue;
           try { saveSettings({ [key]: parseSetting(key, value.trim()) }); }

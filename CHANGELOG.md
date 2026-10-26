@@ -3,6 +3,7 @@
 ## 0.3.0 - 2026-10-24
 
 - Add `/handoff setup` (interactive picker, or `idle=`/`percent=`/`basis=` arguments and `reset`) to save automatic-checkpoint settings in `auto-handoff.json`. CLI flags still take precedence; `/handoff status` shows each value's source.
+- Make the metadata diagnostics log opt-in (`/handoff setup diagnostics=on` or `--handoff-diagnostics on`); by default no `auto-handoff.jsonl` is written.
 
 ## 0.2.0 - 2026-10-24
 

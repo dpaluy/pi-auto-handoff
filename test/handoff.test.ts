@@ -96,6 +96,7 @@ async function fixture(t: TestContext, ephemeral = false, initial?: SessionManag
     sendMessage: forbidden, sendUserMessage: forbidden, exec: forbidden,
   };
   extension(pi);
+  flags.set("handoff-diagnostics", "on");
   const addUser = (text: string) => manager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
   const firstUser = addUser("Implement the feature. Preserve user edits. Do not deploy.");
   manager.appendMessage({ ...response("Tests failed: expected 2, got 1. Next: inspect the condition."), api: model.api, provider: model.provider, model: model.id, timestamp: Date.now() } as any);
@@ -601,4 +602,16 @@ test("interactive /handoff setup edits values through Pi dialogs", async (t) => 
   await f.invoke("setup");
   assert.deepEqual(JSON.parse(await readFile(join(f.dir, "auto-handoff.json"), "utf8")), { contextPercent: 85, contextBasis: "compaction" });
   assert.match(f.notices.at(-1)!, /Context percent: 85 \(saved\)/);
+});
+
+test("diagnostics are off by default and write no file", async (t) => {
+  const f = await fixture(t); f.flags.delete("handoff-diagnostics");
+  await f.invoke(); assert.ok(f.note());
+  assert.deepEqual(await f.diagnostics(), []);
+  await f.invoke("status");
+  assert.match(f.notices.at(-1)!, /Diagnostics: off/);
+  assert.match(f.notices.at(-1)!, /Diagnostics log: off \(default\)/);
+  await f.invoke("setup diagnostics=on");
+  f.addUser("More work."); await f.invoke();
+  assert.deepEqual((await f.diagnostics()).map((record) => record.event), ["start", "saved"]);
 });

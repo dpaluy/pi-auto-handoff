@@ -50,7 +50,7 @@ Defaults: **50 idle minutes** or **70% estimated context use**. Automatic checkp
 Change and save thresholds with `/handoff setup`, which opens a picker in the TUI. Or pass values directly (works in RPC mode too):
 
 ```sh
-/handoff setup idle=30 percent=80 basis=compaction
+/handoff setup idle=30 percent=80 basis=compaction diagnostics=on
 /handoff setup reset
 ```
 
@@ -78,7 +78,7 @@ Each checkpoint request has a **120-second timeout**. On timeout, the extension 
 
 Checkpoint generation sends bounded session text to the active model provider. Provider charges or subscription limits can apply. Notes and retrieved history can contain sensitive information; secret removal is not guaranteed. Retrieved history enters the continuing model's context.
 
-Best-effort diagnostic metadata is stored at Pi's agent directory (`~/.pi/agent/auto-handoff.jsonl` by default), capped at 1 MB plus one rotated backup. It records checkpoint outcomes, timing, truncation, and available usage—not evidence, note text, file paths, or raw errors. Files use private permissions. Contention or write failures may drop records but never prevent checkpointing. A `.lock` file left by a crash is reclaimed on a later append once it is older than 30 seconds; fresh locks still cause records to be dropped rather than waiting.
+Diagnostics are **off by default**. Enable them with `/handoff setup diagnostics=on` (or `--handoff-diagnostics on` for one launch) to debug skipped or failed checkpoints. When enabled, best-effort metadata is stored at Pi's agent directory (`~/.pi/agent/auto-handoff.jsonl` by default), capped at 1 MB plus one rotated backup. It records checkpoint outcomes, timing, truncation, and available usage—not evidence, note text, file paths, or raw errors. Files use private permissions. Contention or write failures may drop records but never prevent checkpointing. A `.lock` file left by a crash is reclaimed on a later append once it is older than 30 seconds; fresh locks still cause records to be dropped rather than waiting.
 
 ## License
 

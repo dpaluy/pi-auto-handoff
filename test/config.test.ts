@@ -10,12 +10,12 @@ const none = () => undefined;
 
 test("defaults apply without a file; saved values beat defaults; flags beat saved values", async (t) => {
   const dir = await temp(t);
-  assert.deepEqual(resolveSettings(none, dir).values, { idleMinutes: 50, contextPercent: 70, contextBasis: "window" });
+  assert.deepEqual(resolveSettings(none, dir).values, { idleMinutes: 50, contextPercent: 70, contextBasis: "window", diagnostics: false });
   saveSettings({ idleMinutes: 30, contextBasis: "compaction" }, dir);
   saveSettings({ contextPercent: 80 }, dir);
   const saved = resolveSettings(none, dir);
-  assert.deepEqual(saved.values, { idleMinutes: 30, contextPercent: 80, contextBasis: "compaction" });
-  assert.deepEqual(saved.sources, { idleMinutes: "saved", contextPercent: "saved", contextBasis: "saved" });
+  assert.deepEqual(saved.values, { idleMinutes: 30, contextPercent: 80, contextBasis: "compaction", diagnostics: false });
+  assert.deepEqual(saved.sources, { idleMinutes: "saved", contextPercent: "saved", contextBasis: "saved", diagnostics: "default" });
   const flagged = resolveSettings((name) => name === "handoff-idle-minutes" ? "5" : undefined, dir);
   assert.equal(flagged.values.idleMinutes, 5); assert.equal(flagged.sources.idleMinutes, "flag");
   assert.equal(((await stat(join(dir, CONFIG_NAME))).mode & 0o777), 0o600);
@@ -38,4 +38,12 @@ test("invalid saved data falls back with a warning; invalid flags and arguments 
   saveSettings({ idleMinutes: 10 }, dir);
   assert.throws(() => saveSettings({ idleMinutes: 9999 }, dir));
   assert.equal(JSON.parse(await readFile(join(dir, CONFIG_NAME), "utf8")).idleMinutes, 10);
+});
+
+test("diagnostics setting parses on/off and defaults off", async (t) => {
+  const dir = await temp(t);
+  assert.equal(resolveSettings(none, dir).values.diagnostics, false);
+  assert.deepEqual(parseSetupArgs("diagnostics=on"), { diagnostics: true });
+  assert.throws(() => parseSetupArgs("diagnostics=yes"), /on or off/);
+  assert.equal(resolveSettings((name) => name === "handoff-diagnostics" ? "on" : undefined, dir).values.diagnostics, true);
 });
